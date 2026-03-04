@@ -1,41 +1,189 @@
 #!/bin/sh
+# =============================================================================
+# CCDC System Backup Script
+# POSIX-compliant, zero-config, optimized for speed and size
+# Saves to /backups/
+# =============================================================================
 
-LOG_FILE="./error_log.txt"
+set -eu
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "This script must be run as root."
   exit 1
 fi
 
-echo "Starting system backup..."
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-# Configuration
-BACKUP_DIR="./backups"
+BACKUP_DIR="/backups"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 HOSTNAME=$(hostname)
+MAX_FILE_SIZE_MB=100
 
-echo "Step 1: Preparing backup directory..."
-mkdir -p "${BACKUP_DIR}" >/dev/null 2>>"$LOG_FILE"
+# =============================================================================
+# DETECT ENVIRONMENT
+# =============================================================================
 
-echo "Step 2: Exporting firewall rules..."
-{
-  if command -v iptables-save >/dev/null 2>&1; then
-    iptables-save >"${BACKUP_DIR}/fw_iptables.rules"
+CPUS=1
+if [ -f /proc/cpuinfo ]; then
+  CPUS=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+elif command -v nproc >/dev/null 2>&1; then
+  CPUS=$(nproc 2>/dev/null || echo 1)
+elif command -v sysctl >/dev/null 2>&1; then
+  CPUS=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+fi
+
+if command -v zstd >/dev/null 2>&1; then
+  COMPRESSOR="zstd -T${CPUS} -3 --long=25"
+  EXT="tar.zst"
+elif command -v pigz >/dev/null 2>&1; then
+  COMPRESSOR="pigz -1 -p ${CPUS}"
+  EXT="tar.gz"
+elif command -v lz4 >/dev/null 2>&1; then
+  COMPRESSOR="lz4 -1"
+  EXT="tar.lz4"
+else
+  COMPRESSOR="gzip -1"
+  EXT="tar.gz"
+fi
+
+THROTTLE=""
+if command -v ionice >/dev/null 2>&1; then
+  THROTTLE="ionice -c 3"
+fi
+if command -v nice >/dev/null 2>&1; then
+  THROTTLE="nice -n 10 ${THROTTLE}"
+fi
+
+echo "[BACKUP] Compressor : ${COMPRESSOR}"
+echo "[BACKUP] CPUs       : ${CPUS}"
+echo "[BACKUP] Throttle   : ${THROTTLE:-none}"
+
+# =============================================================================
+# TAR FEATURE DETECTION
+# =============================================================================
+
+TAR_EXTRA=""
+_tar_help=$(tar --help 2>&1 || true)
+echo "$_tar_help" | grep -q '\-\-sparse' && TAR_EXTRA="${TAR_EXTRA} --sparse"
+echo "$_tar_help" | grep -q '\-\-acls' && TAR_EXTRA="${TAR_EXTRA} --acls"
+echo "$_tar_help" | grep -q '\-\-xattrs' && TAR_EXTRA="${TAR_EXTRA} --xattrs"
+echo "$_tar_help" | grep -q '\-\-selinux' && TAR_EXTRA="${TAR_EXTRA} --selinux"
+echo "$_tar_help" | grep -q '\-\-numeric-owner' && TAR_EXTRA="${TAR_EXTRA} --numeric-owner"
+
+# =============================================================================
+# PREPARE
+# =============================================================================
+
+mkdir -p "${BACKUP_DIR}"
+
+# =============================================================================
+# FIREWALL RULES
+# =============================================================================
+
+echo "[BACKUP] Exporting firewall rules..."
+if command -v iptables-save >/dev/null 2>&1; then
+  iptables-save >"${BACKUP_DIR}/fw_iptables.rules" 2>/dev/null || true
+fi
+if command -v ip6tables-save >/dev/null 2>&1; then
+  ip6tables-save >"${BACKUP_DIR}/fw_ip6tables.rules" 2>/dev/null || true
+fi
+if command -v nft >/dev/null 2>&1; then
+  nft -s list ruleset >"${BACKUP_DIR}/fw_nftables.rules" 2>/dev/null || true
+fi
+
+# =============================================================================
+# PACKAGE LIST
+# =============================================================================
+
+echo "[BACKUP] Saving package list..."
+if command -v dpkg >/dev/null 2>&1; then
+  dpkg --get-selections >"${BACKUP_DIR}/packages_dpkg.list" 2>/dev/null || true
+elif command -v rpm >/dev/null 2>&1; then
+  rpm -qa --qf '%{NAME}\n' | sort >"${BACKUP_DIR}/packages_rpm.list" 2>/dev/null || true
+elif command -v pacman >/dev/null 2>&1; then
+  pacman -Qqe >"${BACKUP_DIR}/packages_pacman.list" 2>/dev/null || true
+elif command -v apk >/dev/null 2>&1; then
+  apk list -I 2>/dev/null | cut -d' ' -f1 >"${BACKUP_DIR}/packages_apk.list" || true
+fi
+
+# =============================================================================
+# CRONTABS
+# =============================================================================
+
+echo "[BACKUP] Saving crontabs..."
+_cron_dir="${BACKUP_DIR}/crontabs"
+mkdir -p "$_cron_dir"
+crontab -l >"${_cron_dir}/root.cron" 2>/dev/null || true
+
+if [ -d /var/spool/cron/crontabs ]; then
+  cp -a /var/spool/cron/crontabs/* "$_cron_dir/" 2>/dev/null || true
+elif [ -d /var/spool/cron ]; then
+  for _f in /var/spool/cron/*; do
+    [ -f "$_f" ] && cp "$_f" "$_cron_dir/" 2>/dev/null || true
+  done
+fi
+
+# =============================================================================
+# DATABASE DUMPS
+# =============================================================================
+
+echo "[BACKUP] Checking for databases..."
+_dump_dir="${BACKUP_DIR}/db_dumps"
+mkdir -p "$_dump_dir"
+
+if command -v mysqldump >/dev/null 2>&1; then
+  if mysqladmin ping >/dev/null 2>&1; then
+    echo "[BACKUP] Dumping MySQL databases..."
+    mysqldump --all-databases --single-transaction --quick \
+      --routines --triggers --events 2>/dev/null \
+      >"${_dump_dir}/mysql_all.sql" || true
   fi
+fi
 
-  if command -v nft >/dev/null 2>&1; then
-    nft list ruleset >"${BACKUP_DIR}/fw_nftables.rules"
+if command -v pg_dumpall >/dev/null 2>&1; then
+  if su - postgres -c "psql -c 'SELECT 1'" >/dev/null 2>&1; then
+    echo "[BACKUP] Dumping PostgreSQL databases..."
+    su - postgres -c "pg_dumpall" 2>/dev/null \
+      >"${_dump_dir}/postgres_all.sql" || true
   fi
-} 2>>"$LOG_FILE"
+fi
 
-echo "Step 3: Generating exclusion list..."
+find "$_dump_dir" -maxdepth 1 -type f -empty -delete 2>/dev/null || true
+
+# =============================================================================
+# EXCLUDE LIST
+# =============================================================================
+
 EXCLUDE_FILE="${BACKUP_DIR}/.exclude.tmp"
 
-# Generate exclude file. Errors appended to log.
-cat <<EOF >"${EXCLUDE_FILE}" 2>>"$LOG_FILE"
+cat >"${EXCLUDE_FILE}" <<'EXCLUDES'
+proc
+sys
+dev
+tmp
+run
+mnt
+media
+lost+found
+backups/.exclude.tmp
+
+var/tmp
+var/cache
+var/log
+usr/share/doc
+usr/share/man
+usr/share/info
+usr/share/locale
+usr/lib/firmware
+usr/lib/modules
+
 *.log
+*.log.*
 *.gz
 *.tar
+*.tar.*
 *.zip
 *.7z
 *.rar
@@ -43,33 +191,15 @@ cat <<EOF >"${EXCLUDE_FILE}" 2>>"$LOG_FILE"
 *.qcow2
 *.vmdk
 *.vdi
-*.mp4
-*.mp3
-*.avi
-*.mov
-*.wav
+*.img
 *.swp
 *.tmp
 *.bak
 *.old
-*.1
-*.2
-
-/proc/*
-/sys/*
-/dev/*
-/tmp/*
-/run/*
-/mnt/*
-/media/*
-/lost+found
-/var/tmp
-/var/cache
-/usr/share/doc
-/usr/share/man
-/usr/share/info
-/var/log/journal
-/var/log/audit
+*.pyc
+*.class
+*.o
+*.obj
 core
 core.*
 
@@ -79,11 +209,6 @@ core.*
 .cache
 __pycache__
 node_modules
-bower_components
-*.pyc
-*.class
-*.o
-*.obj
 .sass-cache
 
 .bash_history
@@ -93,118 +218,160 @@ bower_components
 .mysql_history
 .psql_history
 .rediscli_history
-known_hosts
 
 client_body_temp
 fastcgi_temp
 proxy_temp
 scgi_temp
 uwsgi_temp
-# PHP Sessions
 sess_*
-*.session
 
 mysql-bin.*
 relay-log.*
-*.err
 slow-query.log
-slow.log
 general.log
+aria_log.*
 *.sock
 *.pid
-aria_log.*
+ib_logfile*
+ibdata1
+undo_*
 
 pg_wal
 pg_xlog
 pg_stat_tmp
 pg_replslot
-pg_notify
-pg_subtrans
 pg_log
-.s.PGSQL.*
+postmaster.pid
 
-/var/lib/docker/overlay2
-/var/lib/docker/containers
-/var/lib/docker/image
-/var/lib/docker/tmp
-/var/lib/docker/fuse-overlayfs
-/var/lib/containerd/io.containerd.content.v1.content
-/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs
+var/lib/docker/overlay2
+var/lib/docker/containers
+var/lib/docker/image
+var/lib/docker/tmp
+var/lib/containerd
 docker.sock
 .docker
 
-/var/lib/kubelet/pods
-/var/lib/etcd/member/wal
-
-/var/lib/jenkins/workspace
-/var/lib/jenkins/builds
-/var/lib/jenkins/caches
-/var/lib/jenkins/analytics
-
-/var/lib/teleport/log
-/var/lib/teleport/proc
-
-/var/lib/influxdb/data
-/var/lib/influxdb/wal
-/var/lib/elasticsearch/nodes
-/var/lib/graylog-server/journal
-
-/var/ossec/logs/archives
-/var/ossec/logs/alerts
-/var/ossec/logs/firewall
-/var/ossec/queue/diff
-/var/ossec/var/run
-
-*.retry
-ansible_facts
-galaxy_cache
-cp
+var/lib/kubelet/pods
+var/lib/etcd/member/wal
+var/lib/jenkins/workspace
+var/lib/jenkins/builds
+var/lib/jenkins/caches
+var/lib/teleport/log
+var/lib/teleport/proc
+var/lib/influxdb
+var/lib/elasticsearch/nodes
+var/lib/graylog-server/journal
+var/ossec/logs
+var/ossec/queue/diff
+var/ossec/var/run
+var/spool/postfix/active
+var/spool/postfix/hold
+var/spool/postfix/deferred
+var/spool/exim4/input
 .ansible
+EXCLUDES
 
-/var/spool/postfix/active
-/var/spool/postfix/hold
-/var/spool/postfix/deferred
-/var/spool/exim4/input
-EOF
+# =============================================================================
+# DISCOVER DIRECTORIES
+# =============================================================================
 
-# Append large files to exclude list
-if command -v find >/dev/null 2>&1; then
-  find /root /opt -type f -size +100M 2>>"$LOG_FILE" >>"${EXCLUDE_FILE}"
-fi
+echo "[BACKUP] Scanning for directories..."
 
-echo "Step 4: Identifying directories to backup..."
 DIRS_TO_BACKUP=""
-CANDIDATES="/etc /opt /var/www /var/ossec /var/named /var/lib/bind /var/spool/cron /var/spool/anacron /var/lib/mysql /var/lib/pgsql /srv /usr/local /var/lib/jenkins /var/lib/gitea /var/lib/samba /var/lib/teleport /etc/kubernetes /var/lib/docker/swarm"
-
-for d in $CANDIDATES; do
-  if [ -d "$d" ]; then
-    DIRS_TO_BACKUP="$DIRS_TO_BACKUP $d"
-  fi
+for _d in \
+  /etc \
+  /opt \
+  /root \
+  /home \
+  /srv \
+  /usr/local \
+  /var/www \
+  /var/named \
+  /var/lib/bind \
+  /var/spool/cron \
+  /var/spool/anacron \
+  /var/lib/mysql \
+  /var/lib/pgsql \
+  /var/lib/postgresql \
+  /var/lib/samba \
+  /var/lib/jenkins \
+  /var/lib/gitea \
+  /var/lib/teleport \
+  /var/lib/docker/swarm \
+  /var/lib/docker/volumes \
+  /var/ossec \
+  /etc/kubernetes; do
+  [ -d "$_d" ] && DIRS_TO_BACKUP="${DIRS_TO_BACKUP} ${_d}"
 done
 
-echo "Step 5: Compressing and archiving (This may take a while)..."
-if command -v zstd >/dev/null 2>&1; then
-  COMPRESSOR="zstd -T0 -1"
-  EXT="tar.zst"
-elif command -v pigz >/dev/null 2>&1; then
-  COMPRESSOR="pigz --fast"
-  EXT="tar.gz"
-else
-  COMPRESSOR="gzip -1"
-  EXT="tar.gz"
+if [ -z "$DIRS_TO_BACKUP" ]; then
+  echo "[BACKUP] ERROR: No directories found to back up."
+  rm -f "${EXCLUDE_FILE}"
+  exit 1
 fi
+
+echo "[BACKUP] Excluding files larger than ${MAX_FILE_SIZE_MB}MB..."
+# shellcheck disable=SC2086
+find $DIRS_TO_BACKUP -xdev -type f -size "+${MAX_FILE_SIZE_MB}M" \
+  2>/dev/null >>"${EXCLUDE_FILE}" || true
+
+# =============================================================================
+# COLLECT EXTRA PATHS
+# =============================================================================
+
+EXTRA_PATHS=""
+for _p in \
+  "${BACKUP_DIR}/db_dumps" \
+  "${BACKUP_DIR}/crontabs" \
+  "${BACKUP_DIR}/fw_iptables.rules" \
+  "${BACKUP_DIR}/fw_ip6tables.rules" \
+  "${BACKUP_DIR}/fw_nftables.rules" \
+  "${BACKUP_DIR}/packages_dpkg.list" \
+  "${BACKUP_DIR}/packages_rpm.list" \
+  "${BACKUP_DIR}/packages_pacman.list" \
+  "${BACKUP_DIR}/packages_apk.list"; do
+  [ -e "$_p" ] && EXTRA_PATHS="${EXTRA_PATHS} ${_p}"
+done
+
+# =============================================================================
+# CREATE ARCHIVE
+# =============================================================================
 
 ARCHIVE_NAME="${HOSTNAME}-${TIMESTAMP}.${EXT}"
+ARCHIVE_PATH="${BACKUP_DIR}/${ARCHIVE_NAME}"
 
-if [ -n "$DIRS_TO_BACKUP" ]; then
-  # tar sends errors to log.
-  # tar output (the archive stream) goes to the pipe.
-  # compressor reads the pipe, writes to file, sends errors to log.
-  tar -cf - -X "${EXCLUDE_FILE}" $DIRS_TO_BACKUP 2>>"$LOG_FILE" |
-    $COMPRESSOR >"${BACKUP_DIR}/${ARCHIVE_NAME}" 2>>"$LOG_FILE"
+echo "[BACKUP] Creating: ${ARCHIVE_NAME}"
+
+# shellcheck disable=SC2086
+$THROTTLE tar -cpf - \
+  --one-file-system \
+  ${TAR_EXTRA} \
+  -X "${EXCLUDE_FILE}" \
+  ${DIRS_TO_BACKUP} \
+  ${EXTRA_PATHS} \
+  2>/dev/null |
+  $COMPRESSOR >"${ARCHIVE_PATH}"
+
+# =============================================================================
+# CLEANUP AND REPORT
+# =============================================================================
+
+rm -f "${EXCLUDE_FILE}"
+
+if [ -f "${ARCHIVE_PATH}" ]; then
+  _bytes=$(wc -c <"${ARCHIVE_PATH}" | tr -d ' ')
+  if [ "$_bytes" -ge 1073741824 ] 2>/dev/null; then
+    _size="$((_bytes / 1073741824))GB"
+  elif [ "$_bytes" -ge 1048576 ] 2>/dev/null; then
+    _size="$((_bytes / 1048576))MB"
+  elif [ "$_bytes" -ge 1024 ] 2>/dev/null; then
+    _size="$((_bytes / 1024))KB"
+  else
+    _size="${_bytes}B"
+  fi
+  echo "[BACKUP] Complete: ${ARCHIVE_PATH} (${_size})"
+else
+  echo "[BACKUP] ERROR: Archive was not created."
+  exit 1
 fi
-
-echo "Step 6: Cleaning up..."
-rm -f "${EXCLUDE_FILE}" 2>>"$LOG_FILE"
-
-echo "Finished system backup."
