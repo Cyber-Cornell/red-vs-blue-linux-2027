@@ -1,102 +1,69 @@
 #!/bin/sh
-
-# Exit immediately if a variable is used before being set (prevents "rm -rf /" accidents due to typos)
-set -u
-
-# 1. Root Privilege Check
-# The script modifies system files in /etc/, so it requires root permissions.
-if [ "$(id -u)" -ne 0 ]; then
-  echo "Error: This script must be run as root."
-  exit 1
-fi
-
-# 2. Dependency Check
-# Checks if the 'dconf' binary exists. If the system is headless (no GUI)
-# or doesn't use GNOME, we exit cleanly instead of trying to install things.
-if ! command -v dconf; then
-  echo "dconf not installed"
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
+. "$SCRIPT_DIR/lib/portable.sh"
+MODE=audit
+YES=0
+for option in "$@"; do
+  case "$option" in
+    --audit) MODE=audit ;;
+    --plan) MODE=plan ;;
+    --apply) MODE=apply ;;
+    --yes) YES=1 ;;
+    --help|-h) printf 'Usage: %s --audit | --plan | --apply --yes\nInstalls GNOME automount and recent-history defaults; preserves user databases.\n' "$0"; exit 0 ;;
+    *) die "Unknown option: $option" ;;
+  esac
+done
+PROFILE=/etc/dconf/profile/user
+POLICY=/etc/dconf/db/local.d/01-ccdc-security
+LOCKS=/etc/dconf/db/local.d/locks/01-ccdc-locks
+policy() {
+  printf '%s\n' '[org/gnome/desktop/media-handling]' 'automount=false' 'automount-open=false' '' '[org/gnome/desktop/privacy]' 'remember-recent-files=false'
+}
+if [ "$MODE" = plan ]; then policy; exit 0; fi
+if [ "$MODE" = audit ]; then
+  for file in "$PROFILE" "$POLICY" "$LOCKS"; do
+    if [ -f "$file" ]; then printf '\n--- %s ---\n' "$file"; cat "$file"; fi
+  done
   exit 0
 fi
-
-# 3. Create Directory Structure
-# Ensures the standard dconf configuration paths exist.
-# /etc/dconf/profile stores the hierarchy config.
-# /etc/dconf/db/local.d/locks stores the list of immutable keys.
-mkdir -p /etc/dconf/profile
-mkdir -p /etc/dconf/db/local.d/locks
-
-# 4. Set Profile Hierarchy
-# This creates the 'user' profile. It tells the system to read:
-# 1. The user's individual config (user-db)
-# 2. The system-wide config (system-db:local)
-# Without this file, the settings we write below will be ignored.
-if [ ! -f /etc/dconf/profile/user ]; then
-  printf "user-db:user\nsystem-db:local\n" >/etc/dconf/profile/user
-fi
-
-# 5. Define Security Settings
-# Creates a file in the 'local' database defining the specific values we want.
-# - Disable USB automounting (prevents physical access attacks).
-# - Clear custom keybindings (removes Red Team shells hidden in keyboard shortcuts).
-# - Hide the user list on login (prevents username enumeration).
-# - Disable file history recording (privacy).
-cat >/etc/dconf/db/local.d/01-ccdc-security <<EOF
-[org/gnome/desktop/media-handling]
-automount=false
-automount-open=false
-
-[org/gnome/settings-daemon/plugins/media-keys]
-custom-keybindings=['']
-
-[org/gnome/login-screen]
-disable-user-list=true
-
-[org/gnome/desktop/privacy]
-remember-recent-files=false
-remember-app-usage=false
-remove-old-trash-files=true
-remove-old-temp-files=true
-EOF
-
-# 6. Apply Locks (Immutability)
-# This lists the specific keys that users are FORBIDDEN from changing.
-# Even if a user tries to change these in the Settings GUI, they will be greyed out.
-cat >/etc/dconf/db/local.d/locks/01-ccdc-locks <<EOF
-/org/gnome/desktop/media-handling/automount
-/org/gnome/desktop/media-handling/automount-open
-/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings
-/org/gnome/login-screen/disable-user-list
-/org/gnome/desktop/privacy/remember-recent-files
-EOF
-
-# 7. Compile Database
-# Converts the text files created above into the binary 'dconf' database.
-# Changes will not take effect until this command is run.
-dconf update
-
-# 8. Reset User Configurations
-# Iterates through the system password file to find human users.
-getent passwd | while IFS=: read -r username _ uid _ _ homedir _; do
-
-  # Sanity check to ensure UID is a number (handles malformed lines)
-  case "$uid" in
-  '' | *[!0-9]*) continue ;;
-  esac
-
-  # Filter for standard users (UID 1000+) but skip system users (UID > 60000 like 'nobody')
-  if [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ]; then
-
-    # Check if the user's home directory actually exists
-    if [ -d "$homedir" ]; then
-      DCONF_FILE="$homedir/.config/dconf/user"
-
-      # If the user has a local dconf database, delete it.
-      # This forces the user to inherit the new system-wide locks immediately
-      # the next time they log in.
-      if [ -f "$DCONF_FILE" ]; then
-        echo "Wiping local dconf for: $username"
-        rm -f "$DCONF_FILE"
-      fi
-    fi
-  fi
+[ "$YES" -eq 1 ] || die 'Apply requires --yes'
+require_root
+have_cmd dconf || die 'dconf is unavailable; this stage requires a GNOME host'
+for file in "$PROFILE" "$POLICY" "$LOCKS"; do
+  [ ! -L "$file" ] || die "Refusing symlink: $file"
 done
+if [ -f "$PROFILE" ] && ! grep -qx 'system-db:local' "$PROFILE"; then
+  die 'Existing dconf profile does not include system-db:local; review its hierarchy first'
+fi
+umask 077
+mkdir -p /var/backups /etc/dconf/profile /etc/dconf/db/local.d/locks
+BACKUP=$(mktemp -d /var/backups/ccdc-dconf.XXXXXX)
+for file in "$PROFILE" "$POLICY" "$LOCKS"; do
+  if [ -f "$file" ]; then cp -p "$file" "$BACKUP/$(basename "$file")"; fi
+done
+cat >"$BACKUP/restore.sh" <<'EOF'
+#!/bin/sh
+set -eu
+BACKUP=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
+for file in /etc/dconf/profile/user /etc/dconf/db/local.d/01-ccdc-security /etc/dconf/db/local.d/locks/01-ccdc-locks; do
+  [ ! -L "$file" ] || exit 1
+  if [ -f "$BACKUP/$(basename "$file")" ]; then cp -p "$BACKUP/$(basename "$file")" "$file"; else rm -f "$file"; fi
+done
+dconf update
+EOF
+chmod 700 "$BACKUP/restore.sh"
+on_exit() {
+  result=$?
+  trap - 0
+  if [ "$result" -ne 0 ]; then sh "$BACKUP/restore.sh" || log_error "Rollback incomplete: $BACKUP/restore.sh"; fi
+  exit "$result"
+}
+trap on_exit 0
+trap 'exit 1' HUP INT TERM
+if [ ! -f "$PROFILE" ]; then printf 'user-db:user\nsystem-db:local\n' >"$PROFILE"; fi
+policy >"$POLICY"
+printf '%s\n' '/org/gnome/desktop/media-handling/automount' '/org/gnome/desktop/media-handling/automount-open' '/org/gnome/desktop/privacy/remember-recent-files' >"$LOCKS"
+chmod 644 "$PROFILE" "$POLICY" "$LOCKS"
+dconf update
+log_ok "Desktop policy compiled; users must log out and back in. Rollback: $BACKUP/restore.sh"

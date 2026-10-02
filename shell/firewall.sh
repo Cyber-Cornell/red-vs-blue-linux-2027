@@ -1,199 +1,330 @@
 #!/bin/sh
-# ==============================================================================
-# Firewall Configuration Script
-# Supports: Linux (iptables/nftables), Solaris (ipf)
-# ==============================================================================
+# Competition-safe inbound firewall allowlist.
+# The script owns only an nftables table or dedicated iptables chains and never
+# flushes distribution, Docker, Kubernetes, or service-managed rules.
 
-set -e
+set -u
 
-log_info() { printf "\033[0;32m[INFO]\033[0m %s\n" "$1"; }
-log_warn() { printf "\033[0;33m[WARN]\033[0m %s\n" "$1"; }
-log_err() { printf "\033[0;31m[ERROR]\033[0m %s\n" "$1" >&2; }
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd)
+# shellcheck source=lib/portable.sh
+. "$SCRIPT_DIR/lib/portable.sh"
 
-if [ "$(id -u)" -ne 0 ]; then
-  log_err "This script must be run as root."
-  exit 1
+MODE=audit
+YES=0
+BACKEND=auto
+TCP_RAW=${CCDC_TCP_PORTS:-}
+UDP_RAW=${CCDC_UDP_PORTS:-}
+TCP_PORTS=''
+UDP_PORTS=''
+WORK_DIR=''
+
+usage() {
+  cat <<EOF
+Usage:
+  $0 --audit
+  $0 --plan --tcp-ports LIST [--udp-ports LIST]
+  $0 --apply --yes --tcp-ports LIST [--udp-ports LIST] [--backend auto|nft|iptables]
+
+LIST is comma-separated and may include ranges: 22,53,80,443,8000-8100.
+Rules are runtime-only so a reboot returns to the host's existing persistent
+policy. Re-run after reboot only after checking scored-service requirements.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --audit) MODE=audit ;;
+    --plan) MODE=plan ;;
+    --apply) MODE=apply ;;
+    --yes) YES=1 ;;
+    --backend)
+      shift
+      [ "$#" -gt 0 ] || die '--backend requires auto, nft, or iptables'
+      BACKEND=$1
+      ;;
+    --backend=*) BACKEND=${1#*=} ;;
+    --tcp-ports)
+      shift
+      [ "$#" -gt 0 ] || die '--tcp-ports requires a list'
+      TCP_RAW=$1
+      ;;
+    --tcp-ports=*) TCP_RAW=${1#*=} ;;
+    --udp-ports)
+      shift
+      [ "$#" -gt 0 ] || die '--udp-ports requires a list'
+      UDP_RAW=$1
+      ;;
+    --udp-ports=*) UDP_RAW=${1#*=} ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
+done
+
+case "$BACKEND" in auto|nft|iptables) ;; *) die "Invalid backend: $BACKEND" ;; esac
+
+cleanup() {
+  if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+    rm -f "$WORK_DIR"/* 2>/dev/null || true
+    rmdir "$WORK_DIR" 2>/dev/null || true
+  fi
+}
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+normalize_ports() {
+  _raw=$1
+  _label=$2
+  _result=''
+  _old_ifs=$IFS
+  IFS=', '
+  set -f
+  # Intentional field splitting of a validated operator list.
+  # shellcheck disable=SC2086
+  set -- $_raw
+  set +f
+  IFS=$_old_ifs
+  for _spec in "$@"; do
+    [ -n "$_spec" ] || continue
+    case "$_spec" in
+      *-*)
+        _start=${_spec%%-*}
+        _end=${_spec#*-}
+        case "$_start:$_end" in
+          *[!0-9:]*|:*) die "Invalid $_label port range: $_spec" ;;
+        esac
+        [ -n "$_end" ] || die "Invalid $_label port range: $_spec"
+        [ "$_start" -ge 1 ] 2>/dev/null && [ "$_end" -le 65535 ] 2>/dev/null && [ "$_start" -le "$_end" ] 2>/dev/null ||
+          die "Invalid $_label port range: $_spec"
+        ;;
+      *)
+        case "$_spec" in *[!0-9]*) die "Invalid $_label port: $_spec" ;; esac
+        [ "$_spec" -ge 1 ] 2>/dev/null && [ "$_spec" -le 65535 ] 2>/dev/null ||
+          die "Invalid $_label port: $_spec"
+        ;;
+    esac
+    case " $_result " in *" $_spec "*) ;; *) _result="${_result}${_result:+ }$_spec" ;; esac
+  done
+  printf '%s\n' "$_result"
+}
+
+port_list_contains() {
+  _needle=$1
+  shift
+  for _spec in "$@"; do
+    case "$_spec" in
+      *-*)
+        _start=${_spec%%-*}
+        _end=${_spec#*-}
+        [ "$_needle" -ge "$_start" ] 2>/dev/null && [ "$_needle" -le "$_end" ] 2>/dev/null && return 0
+        ;;
+      *) [ "$_needle" = "$_spec" ] && return 0 ;;
+    esac
+  done
+  return 1
+}
+
+choose_backend() {
+  if [ "$BACKEND" = auto ]; then
+    if have_cmd nft && nft list ruleset >/dev/null 2>&1; then
+      BACKEND=nft
+    elif have_cmd iptables && have_cmd iptables-save; then
+      BACKEND=iptables
+    else
+      die 'Neither a working nftables nor iptables backend was found'
+    fi
+  fi
+  case "$BACKEND" in
+    nft) have_cmd nft || die 'nft command not found' ;;
+    iptables) have_cmd iptables && have_cmd iptables-save && have_cmd iptables-restore || die 'iptables tools not found' ;;
+  esac
+}
+
+audit_firewall() {
+  log_info 'Listening sockets'
+  ss -H -lntup 2>/dev/null || netstat -lntup 2>/dev/null || true
+  if have_cmd nft; then
+    log_info 'nftables ruleset'
+    nft -s list ruleset 2>/dev/null || true
+  fi
+  if have_cmd iptables-save; then
+    log_info 'iptables IPv4 ruleset'
+    iptables-save 2>/dev/null || true
+  fi
+  if have_cmd ip6tables-save; then
+    log_info 'iptables IPv6 ruleset'
+    ip6tables-save 2>/dev/null || true
+  fi
+}
+
+TCP_PORTS=$(normalize_ports "$TCP_RAW" TCP) || exit 1
+UDP_PORTS=$(normalize_ports "$UDP_RAW" UDP) || exit 1
+
+if [ "$MODE" = audit ]; then
+  require_root
+  [ "$(uname -s 2>/dev/null)" = Linux ] || die 'This firewall workflow supports Linux only'
+  audit_firewall
+  exit 0
 fi
 
-# Detect OS and firewall system
-OS_TYPE="linux"
-FIREWALL_SYS="iptables"
+[ -n "$TCP_PORTS$UDP_PORTS" ] || die 'At least one TCP or UDP scored-service port is required'
 
-case "$(uname -s)" in
-SunOS)
-  OS_TYPE="solaris"
-  FIREWALL_SYS="ipf"
-  ;;
-Linux)
-  if command -v nft >/dev/null 2>&1 && [ -f /etc/nftables.conf ]; then
-    FIREWALL_SYS="nftables"
+if [ -n "${SSH_CONNECTION:-}" ]; then
+  _old_ifs=$IFS
+  IFS=' '
+  # SSH_CONNECTION: client-address client-port server-address server-port
+  # shellcheck disable=SC2086
+  set -- $SSH_CONNECTION
+  IFS=$_old_ifs
+  _ssh_port=${4:-}
+  if [ -n "$_ssh_port" ]; then
+    # Intentional splitting of normalized numeric port specs.
+    # shellcheck disable=SC2086
+    port_list_contains "$_ssh_port" $TCP_PORTS ||
+      die "Active SSH uses TCP $_ssh_port, which is absent from --tcp-ports"
   fi
-  ;;
-esac
+fi
 
-log_info "Starting firewall configuration..."
-log_info "Detected: $OS_TYPE / $FIREWALL_SYS"
+printf 'Backend: %s\n' "$BACKEND"
+printf 'Allowed inbound TCP: %s\n' "${TCP_PORTS:-none}"
+printf 'Allowed inbound UDP: %s\n' "${UDP_PORTS:-none}"
+printf '%s\n' 'Always allowed: loopback, established/related traffic, essential ICMP, DHCP client replies'
+printf '%s\n' 'All other new inbound traffic: logged at a limited rate, then dropped'
 
-# ==============================================================================
-# SOLARIS IP FILTER
-# ==============================================================================
-configure_solaris_ipf() {
-  log_info "Configuring Solaris IP Filter..."
+[ "$MODE" = apply ] || exit 0
+[ "$YES" -eq 1 ] || die 'Apply requires --yes'
+require_root
+[ "$(uname -s 2>/dev/null)" = Linux ] || die 'This firewall workflow supports Linux only'
+choose_backend
 
-  mkdir -p /etc/ipf
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ccdc-firewall.XXXXXX") || die 'Cannot create temporary directory'
+STAMP=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d_%H%M%S')
+umask 077
+ROLLBACK_DIR=$(mktemp -d "/var/backups/ccdc-firewall-$STAMP.XXXXXX") || die 'Cannot create firewall backup directory'
+chmod 700 "$ROLLBACK_DIR"
 
-  cat >/etc/ipf/ipf.conf <<'EOF'
-# Solaris IP Filter Rules
-pass in quick on lo0 all
-pass out quick on lo0 all
-
-block in log quick all with short
-block in log quick all with opt lsrr
-block in log quick all with opt ssrr
-
-pass in quick proto tcp all flags S/SA keep state
-pass out quick proto tcp all flags S/SA keep state
-pass in quick proto udp all keep state
-pass out quick proto udp all keep state
-
-# Allow SSH
-pass in quick proto tcp from any to any port = 22 flags S/SA keep state
-
-# Allow HTTP/HTTPS
-pass in quick proto tcp from any to any port = 80 flags S/SA keep state
-pass in quick proto tcp from any to any port = 443 flags S/SA keep state
-
-# ICMP
-pass in quick proto icmp all icmp-type echo keep state
-pass out quick proto icmp all keep state
-
-# Default deny incoming
-block in log all
-pass out all
-EOF
-
-  chmod 644 /etc/ipf/ipf.conf
-
-  if svcs -a 2>/dev/null | grep -q "ipfilter"; then
-    svcadm enable network/ipfilter
-    svcadm refresh network/ipfilter
+apply_nft() {
+  nft -s list ruleset >"$ROLLBACK_DIR/nft-full.rules" || return 1
+  if nft list table inet ccdc >/dev/null 2>&1; then
+    nft -s list table inet ccdc >"$ROLLBACK_DIR/nft-previous-ccdc.rules" || return 1
+    printf '%s\n' yes >"$ROLLBACK_DIR/had-ccdc-table"
   else
-    ipf -Fa -f /etc/ipf/ipf.conf
+    printf '%s\n' no >"$ROLLBACK_DIR/had-ccdc-table"
   fi
 
-  log_info "Solaris IP Filter configured"
-}
+  _rules="$WORK_DIR/ccdc.nft"
+  {
+    if [ "$(cat "$ROLLBACK_DIR/had-ccdc-table")" = yes ]; then
+      printf '%s\n' 'delete table inet ccdc'
+    fi
+    printf '%s\n' 'table inet ccdc {'
+    printf '%s\n' '  chain input {'
+    printf '%s\n' '    type filter hook input priority -10; policy drop;'
+    printf '%s\n' '    iifname "lo" accept'
+    printf '%s\n' '    ct state established,related accept'
+    printf '%s\n' '    ct state invalid drop'
+    printf '%s\n' '    ip protocol icmp accept'
+    printf '%s\n' '    meta l4proto ipv6-icmp accept'
+    printf '%s\n' '    udp sport 67 udp dport 68 accept'
+    printf '%s\n' '    udp sport 547 udp dport 546 accept'
+    for _port in $TCP_PORTS; do
+      printf '    tcp dport %s ct state new accept\n' "$_port"
+    done
+    for _port in $UDP_PORTS; do
+      printf '    udp dport %s accept\n' "$_port"
+    done
+    printf '%s\n' '    limit rate 5/second burst 10 packets log prefix "CCDC-DROP " level warning'
+    printf '%s\n' '    drop'
+    printf '%s\n' '  }'
+    printf '%s\n' '}'
+  } >"$_rules"
 
-# ==============================================================================
-# LINUX IPTABLES
-# ==============================================================================
-configure_linux_iptables() {
-  log_info "Configuring Linux iptables..."
-
-  # Reset rules
-  iptables -P INPUT ACCEPT
-  iptables -P FORWARD ACCEPT
-  iptables -P OUTPUT ACCEPT
-  iptables -F
-  iptables -X
-  iptables -t nat -F
-  iptables -t mangle -F
-
-  ip6tables -P INPUT ACCEPT
-  ip6tables -P FORWARD ACCEPT
-  ip6tables -P OUTPUT ACCEPT
-  ip6tables -F
-  ip6tables -X
-
-  # Create logging chains
-  iptables -N SSH-INITIAL-LOG 2>/dev/null || iptables -F SSH-INITIAL-LOG
-  iptables -N ICMP-FLOOD 2>/dev/null || iptables -F ICMP-FLOOD
-  ip6tables -N SSH-INITIAL-LOG 2>/dev/null || ip6tables -F SSH-INITIAL-LOG
-  ip6tables -N ICMP-FLOOD 2>/dev/null || ip6tables -F ICMP-FLOOD
-
-  # SSH logging chain
-  iptables -A SSH-INITIAL-LOG -m limit --limit 4/sec -j LOG --log-prefix "IPTables-SSH: " --log-level 5
-  iptables -A SSH-INITIAL-LOG -j RETURN
-  ip6tables -A SSH-INITIAL-LOG -m limit --limit 4/sec -j LOG --log-prefix "IP6Tables-SSH: " --log-level 5
-  ip6tables -A SSH-INITIAL-LOG -j RETURN
-
-  # ICMP flood protection
-  iptables -A ICMP-FLOOD -m recent --set --name ICMP-FLOOD --rsource
-  iptables -A ICMP-FLOOD -m recent --update --seconds 1 --hitcount 6 --name ICMP-FLOOD --rsource -j DROP
-  iptables -A ICMP-FLOOD -j ACCEPT
-  ip6tables -A ICMP-FLOOD -m recent --set --name ICMP-FLOOD --rsource
-  ip6tables -A ICMP-FLOOD -m recent --update --seconds 1 --hitcount 6 --name ICMP-FLOOD --rsource -j DROP
-  ip6tables -A ICMP-FLOOD -j ACCEPT
-
-  # Loopback
-  iptables -A INPUT -i lo -j ACCEPT
-  iptables -A OUTPUT -o lo -j ACCEPT
-  ip6tables -A INPUT -i lo -j ACCEPT
-  ip6tables -A OUTPUT -o lo -j ACCEPT
-
-  # Established connections
-  iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-  iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-  ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-  ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-  # Drop invalid
-  iptables -A INPUT -m state --state INVALID -j DROP
-  ip6tables -A INPUT -m state --state INVALID -j DROP
-
-  # SSH with rate limiting
-  iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --set --name SSH
-  iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 60 --hitcount 4 --name SSH -j DROP
-  iptables -A INPUT -p tcp --dport 22 -m state --state NEW -j SSH-INITIAL-LOG
-  iptables -A INPUT -p tcp --dport 22 -m state --state NEW -j ACCEPT
-  ip6tables -A INPUT -p tcp --dport 22 -m state --state NEW -j ACCEPT
-
-  # HTTP/HTTPS
-  iptables -A INPUT -p tcp --dport 80 -m state --state NEW -j ACCEPT
-  iptables -A INPUT -p tcp --dport 443 -m state --state NEW -j ACCEPT
-  ip6tables -A INPUT -p tcp --dport 80 -m state --state NEW -j ACCEPT
-  ip6tables -A INPUT -p tcp --dport 443 -m state --state NEW -j ACCEPT
-
-  # ICMP
-  iptables -A INPUT -p icmp --icmp-type echo-request -j ICMP-FLOOD
-  ip6tables -A INPUT -p icmpv6 --icmpv6-type echo-request -j ICMP-FLOOD
-
-  # Default policies
-  iptables -P INPUT DROP
-  iptables -P FORWARD DROP
-  iptables -P OUTPUT ACCEPT
-  ip6tables -P INPUT DROP
-  ip6tables -P FORWARD DROP
-  ip6tables -P OUTPUT ACCEPT
-
-  # Save rules
-  if [ -f /etc/debian_version ]; then
-    mkdir -p /etc/iptables
-    iptables-save >/etc/iptables/rules.v4
-    ip6tables-save >/etc/iptables/rules.v6
-  elif [ -f /etc/redhat-release ]; then
-    service iptables save 2>/dev/null || iptables-save >/etc/sysconfig/iptables
-  elif [ -f /etc/alpine-release ]; then
-    mkdir -p /etc/iptables
-    iptables-save >/etc/iptables/rules-save
-    ip6tables-save >/etc/iptables/rules6-save
-    rc-update add iptables default 2>/dev/null || true
-    rc-update add ip6tables default 2>/dev/null || true
+  nft -c -f "$_rules" || die 'Generated nftables policy failed validation'
+  if ! nft -f "$_rules"; then
+    log_error 'Atomic nftables transaction failed; previous policy remains installed'
+    return 1
   fi
-
-  log_info "Linux iptables configured"
+  nft list table inet ccdc >"$ROLLBACK_DIR/nft-applied.rules"
 }
 
-# ==============================================================================
-# MAIN
-# ==============================================================================
-case "$OS_TYPE" in
-solaris)
-  configure_solaris_ipf
-  ;;
-linux)
-  configure_linux_iptables
-  ;;
+iptables_add_ports() {
+  _binary=$1
+  _chain=$2
+  _protocol=$3
+  _ports=$4
+  for _port in $_ports; do
+    _iptables_port=$(printf '%s' "$_port" | tr '-' ':')
+    "$_binary" -A "$_chain" -p "$_protocol" --dport "$_iptables_port" -m conntrack --ctstate NEW -j ACCEPT || return 1
+  done
+}
+
+build_iptables_chain() {
+  _binary=$1
+  _chain=$2
+  "$_binary" -N "$_chain" 2>/dev/null || "$_binary" -L "$_chain" >/dev/null 2>&1 || return 1
+  "$_binary" -F "$_chain" || return 1
+  "$_binary" -A "$_chain" -i lo -j ACCEPT || return 1
+  "$_binary" -A "$_chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+  "$_binary" -A "$_chain" -m conntrack --ctstate INVALID -j DROP || return 1
+  if [ "$_binary" = ip6tables ]; then
+    "$_binary" -A "$_chain" -p ipv6-icmp -j ACCEPT || return 1
+    "$_binary" -A "$_chain" -p udp --sport 547 --dport 546 -j ACCEPT || return 1
+  else
+    "$_binary" -A "$_chain" -p icmp -j ACCEPT || return 1
+    "$_binary" -A "$_chain" -p udp --sport 67 --dport 68 -j ACCEPT || return 1
+  fi
+  iptables_add_ports "$_binary" "$_chain" tcp "$TCP_PORTS" || return 1
+  iptables_add_ports "$_binary" "$_chain" udp "$UDP_PORTS" || return 1
+  "$_binary" -A "$_chain" -m limit --limit 5/second --limit-burst 10 -j LOG --log-prefix 'CCDC-DROP ' --log-level 4 || return 1
+  "$_binary" -A "$_chain" -j DROP || return 1
+  "$_binary" -C INPUT -j "$_chain" 2>/dev/null || "$_binary" -I INPUT 1 -j "$_chain"
+}
+
+apply_iptables() {
+  iptables-save >"$ROLLBACK_DIR/iptables.v4" || return 1
+  if have_cmd ip6tables; then
+    have_cmd ip6tables-save && have_cmd ip6tables-restore || return 1
+    ip6tables-save >"$ROLLBACK_DIR/iptables.v6" || return 1
+  fi
+  if ! build_iptables_chain iptables CCDC_INPUT; then
+    log_error 'IPv4 apply failed; restoring the previous ruleset'
+    iptables-restore <"$ROLLBACK_DIR/iptables.v4" 2>/dev/null || true
+    return 1
+  fi
+  if have_cmd ip6tables && have_cmd ip6tables-save; then
+    if ! build_iptables_chain ip6tables CCDC_INPUT; then
+      log_error 'IPv6 apply failed; restoring both previous rulesets'
+      iptables-restore <"$ROLLBACK_DIR/iptables.v4" 2>/dev/null || true
+      have_cmd ip6tables-restore && ip6tables-restore <"$ROLLBACK_DIR/iptables.v6" 2>/dev/null || true
+      return 1
+    fi
+  else
+    log_warn 'ip6tables is unavailable; verify IPv6 exposure separately'
+  fi
+  iptables-save >"$ROLLBACK_DIR/iptables-applied.v4"
+}
+
+case "$BACKEND" in
+  nft) apply_nft || die 'Firewall apply failed; inspect rollback material' ;;
+  iptables) apply_iptables || die 'Firewall apply failed; inspect rollback material' ;;
 esac
 
-log_info "Firewall configuration complete!"
+cat >"$ROLLBACK_DIR/README.txt" <<EOF
+Firewall rollback captured before the CCDC allowlist was applied.
+
+nftables full restore (replaces the entire active ruleset):
+  nft flush ruleset
+  nft -f $ROLLBACK_DIR/nft-full.rules
+
+iptables restore:
+  iptables-restore < $ROLLBACK_DIR/iptables.v4
+  ip6tables-restore < $ROLLBACK_DIR/iptables.v6
+
+Use the commands that match the backend recorded by this run. Console access is
+recommended before restoring or changing firewall policy.
+EOF
+chmod 600 "$ROLLBACK_DIR"/* 2>/dev/null || true
+log_ok "Firewall applied with $BACKEND"
+log_info "Rollback material: $ROLLBACK_DIR"

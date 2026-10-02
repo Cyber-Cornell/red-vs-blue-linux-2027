@@ -1,7 +1,2 @@
-prometheus
-grafana
-alertmanager
-node_exporter
-snmp_exporter
-loki
-promtail
+# Approved human, non-administrator accounts (one per line).
+# Populate this from the competition packet and the current business need.

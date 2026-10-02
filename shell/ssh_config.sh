@@ -1,321 +1,280 @@
 #!/bin/sh
-# ==============================================================================
-# SSH Configuration Script
-# Supports: Linux (all distros), NodeOS, Solaris/illumos
-# Uses configs/sshd_config and configs/authorized_keys when available
-# ==============================================================================
+# Harden OpenSSH with a validated, reversible drop-in and a service reload.
+# Existing authorized_keys and host keys are never replaced.
 
-set -e
+set -u
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd)
+# shellcheck source=lib/portable.sh
+. "$SCRIPT_DIR/lib/portable.sh"
 
-# Source detection library or inline
-if [ -f "$SCRIPT_DIR/lib/detect.sh" ]; then
-  . "$SCRIPT_DIR/lib/detect.sh"
+MODE=audit
+YES=0
+ALLOW_ROOT_LOCKOUT=0
+SOURCE_CONFIG="$SCRIPT_DIR/configs/sshd_config"
+SSHD_CONFIG=/etc/ssh/sshd_config
+DROPIN_DIR=/etc/ssh/sshd_config.d
+DROPIN="$DROPIN_DIR/00-ccdc-hardening.conf"
+INCLUDE_LINE='Include /etc/ssh/sshd_config.d/*.conf'
+SSHD_BIN=''
+SERVICE=''
+ROLLBACK_DIR=''
+MAIN_BACKUP=''
+DROPIN_BACKUP=''
+DROPIN_EXISTED=0
+
+usage() {
+  cat <<EOF
+Usage:
+  $0 --audit
+  $0 --plan
+  $0 --apply --yes [--allow-root-lockout]
+
+The apply workflow prepends the standard sshd_config.d include, writes a
+managed hardening drop-in, validates the complete configuration, and reloads
+the daemon. It preserves host keys, user keys, and existing sessions.
+
+--allow-root-lockout bypasses the check for a viable non-root admin account.
+Use it only with tested console access.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --audit) MODE=audit ;;
+    --plan) MODE=plan ;;
+    --apply) MODE=apply ;;
+    --yes) YES=1 ;;
+    --allow-root-lockout) ALLOW_ROOT_LOCKOUT=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
+done
+
+if [ "$MODE" = plan ]; then
+  [ -s "$SOURCE_CONFIG" ] || die "Missing or empty $SOURCE_CONFIG"
+  printf '%s
+' 'Managed SSH directives:'
+  sed -n '/^[[:space:]]*#/d; /^[[:space:]]*$/d; p' "$SOURCE_CONFIG"
+  exit 0
+fi
+[ "$MODE" != apply ] || [ "$YES" -eq 1 ] || die 'Apply requires --yes'
+require_root
+[ "$(uname -s 2>/dev/null)" = Linux ] || die 'This SSH workflow supports Linux only'
+[ -s "$SOURCE_CONFIG" ] || die "Missing or empty $SOURCE_CONFIG"
+[ -f "$SSHD_CONFIG" ] || die "$SSHD_CONFIG does not exist"
+
+if have_cmd sshd; then
+  SSHD_BIN=$(command -v sshd)
+elif [ -x /usr/sbin/sshd ]; then
+  SSHD_BIN=/usr/sbin/sshd
 else
-  case "$(uname -s)" in
-  SunOS) OS_TYPE="solaris" ;;
-  Linux)
-    OS_TYPE="linux"
-    if [ -f /etc/nodeos-release ] || [ -d /node_modules ]; then
-      OS_FAMILY="nodeos"
-    fi
-    ;;
-  esac
-
-  if command -v svcadm >/dev/null 2>&1; then
-    INIT_SYS="smf"
-  elif [ -d /run/systemd/system ]; then
-    INIT_SYS="systemd"
-  elif command -v rc-service >/dev/null 2>&1; then
-    INIT_SYS="openrc"
-  else
-    INIT_SYS="sysv"
-  fi
+  die 'OpenSSH server is not installed'
 fi
 
-log_info() { printf "\033[0;32m[INFO]\033[0m %s\n" "$1"; }
-log_warn() { printf "\033[0;33m[WARN]\033[0m %s\n" "$1"; }
-log_err() { printf "\033[0;31m[ERROR]\033[0m %s\n" "$1" >&2; }
-
-if [ "$(id -u)" -ne 0 ]; then
-  log_err "This script must be run as root."
-  exit 1
+if have_cmd systemctl && [ -d /run/systemd/system ]; then
+  if systemctl cat ssh.service >/dev/null 2>&1; then SERVICE=ssh; else SERVICE=sshd; fi
+elif have_cmd rc-service; then
+  if rc-service sshd status >/dev/null 2>&1; then SERVICE=sshd; else SERVICE=ssh; fi
+elif [ -x /etc/init.d/ssh ]; then
+  SERVICE=ssh
+else
+  SERVICE=sshd
 fi
 
-log_info "Starting SSH configuration..."
-log_info "Detected OS: $OS_TYPE, Init: $INIT_SYS"
-
-# ==============================================================================
-# DETECT SSH CONFIG PATHS
-# ==============================================================================
-detect_ssh_paths() {
-  case "$OS_TYPE" in
-  solaris)
-    SSHD_CONFIG="/etc/ssh/sshd_config"
-    SSH_DIR="/etc/ssh"
-    SSH_SERVICE="network/ssh"
-    SSH_BINARY="/usr/lib/ssh/sshd"
-    SFTP_SERVER="/usr/lib/ssh/sftp-server"
-    ;;
-  linux)
-    SSHD_CONFIG="/etc/ssh/sshd_config"
-    SSH_DIR="/etc/ssh"
-    if [ -f "/lib/systemd/system/ssh.service" ] || [ -f "/usr/lib/systemd/system/ssh.service" ]; then
-      SSH_SERVICE="ssh"
-    else
-      SSH_SERVICE="sshd"
-    fi
-    SSH_BINARY="/usr/sbin/sshd"
-    SFTP_SERVER="/usr/lib/openssh/sftp-server"
-    # Alpine uses different path
-    if [ -f /etc/alpine-release ]; then
-      SFTP_SERVER="/usr/lib/ssh/sftp-server"
-    fi
-    ;;
-  *)
-    SSHD_CONFIG="/etc/ssh/sshd_config"
-    SSH_DIR="/etc/ssh"
-    SSH_SERVICE="sshd"
-    ;;
-  esac
-
-  log_info "SSH config: $SSHD_CONFIG"
-  log_info "SSH service: $SSH_SERVICE"
-}
-
-# ==============================================================================
-# GENERATE SSH HOST KEYS
-# ==============================================================================
-generate_host_keys() {
-  log_info "Generating SSH host keys..."
-
-  mkdir -p "$SSH_DIR"
-
-  case "$OS_TYPE" in
-  solaris)
-    if [ ! -f "$SSH_DIR/ssh_host_rsa_key" ]; then
-      /usr/bin/ssh-keygen -t rsa -b 4096 -f "$SSH_DIR/ssh_host_rsa_key" -N ""
-    fi
-    if [ ! -f "$SSH_DIR/ssh_host_ed25519_key" ]; then
-      /usr/bin/ssh-keygen -t ed25519 -f "$SSH_DIR/ssh_host_ed25519_key" -N ""
-    fi
-    ;;
-  linux)
-    if command -v ssh-keygen >/dev/null 2>&1; then
-      ssh-keygen -A
-    fi
-    ;;
-  esac
-}
-
-# ==============================================================================
-# APPLY SSHD CONFIG FROM configs/sshd_config
-# ==============================================================================
-apply_sshd_config() {
-  log_info "Applying sshd_config..."
-
-  # Backup existing config
-  if [ -f "$SSHD_CONFIG" ]; then
-    cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-  fi
-
-  # Check if custom config exists in configs directory
-  if [ -f "$SCRIPT_DIR/configs/sshd_config" ]; then
-    log_info "Using configs/sshd_config"
-    cat "$SCRIPT_DIR/configs/sshd_config" >"$SSHD_CONFIG"
-  else
-    log_err "configs/sshd_config not found!"
-    exit 1
-  fi
-
-  # Add OS-specific settings
-  case "$OS_TYPE" in
-  solaris)
-    log_info "Adding Solaris-specific SSH settings..."
-    # Ensure Subsystem is set correctly for Solaris
-    if ! grep -q "^Subsystem" "$SSHD_CONFIG"; then
-      echo "" >>"$SSHD_CONFIG"
-      echo "# Solaris SFTP subsystem" >>"$SSHD_CONFIG"
-      echo "Subsystem sftp $SFTP_SERVER" >>"$SSHD_CONFIG"
-    fi
-    ;;
-  linux)
-    # Add Subsystem if not present
-    if ! grep -q "^Subsystem" "$SSHD_CONFIG"; then
-      echo "" >>"$SSHD_CONFIG"
-      echo "# SFTP subsystem" >>"$SSHD_CONFIG"
-      echo "Subsystem sftp $SFTP_SERVER" >>"$SSHD_CONFIG"
-    fi
-    ;;
-  esac
-
-  chmod 600 "$SSHD_CONFIG"
-}
-
-# ==============================================================================
-# VALIDATE CONFIG
-# ==============================================================================
 validate_config() {
-  log_info "Validating SSH configuration..."
+  "$SSHD_BIN" -t -f "$SSHD_CONFIG"
+}
 
-  if command -v sshd >/dev/null 2>&1; then
-    if sshd -t -f "$SSHD_CONFIG" 2>&1; then
-      log_info "SSH configuration is valid."
+reload_service() {
+  if have_cmd systemctl && [ -d /run/systemd/system ]; then
+    systemctl reload "$SERVICE" 2>/dev/null || systemctl restart "$SERVICE"
+    systemctl is-active --quiet "$SERVICE"
+  elif have_cmd rc-service; then
+    rc-service "$SERVICE" reload 2>/dev/null || rc-service "$SERVICE" restart
+  elif [ -x "/etc/init.d/$SERVICE" ]; then
+    "/etc/init.d/$SERVICE" reload 2>/dev/null || "/etc/init.d/$SERVICE" restart
+  else
+    _pid=$(cat /run/sshd.pid /var/run/sshd.pid 2>/dev/null | sed -n '1p')
+    [ -n "$_pid" ] || return 1
+    kill -HUP "$_pid"
+  fi
+}
+
+summarize_auth_events() {
+  awk '
+    {
+      total++
+      value=tolower($0)
+      if (value ~ /(failed|failure)/) failed++
+      if (value ~ /(accepted|success)/) accepted++
+      if (value ~ /invalid user/) invalid++
+      if (value ~ /(disconnect|closed)/) disconnected++
+    }
+    END {
+      printf "records.total=%d accepted_or_success=%d failed_or_failure=%d invalid_user=%d disconnected_or_closed=%d values_suppressed=yes\n", total, accepted+0, failed+0, invalid+0, disconnected+0
+    }
+  '
+}
+
+audit_ssh() {
+  log_info "sshd binary: $SSHD_BIN"
+  log_info "service name: $SERVICE"
+  printf '\n--- configuration syntax ---\n'
+  validate_config || return 1
+  printf '\n--- effective security settings ---\n'
+  "$SSHD_BIN" -T -f "$SSHD_CONFIG" 2>/dev/null |
+    grep -E '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|permitemptypasswords|allowtcpforwarding|allowagentforwarding|x11forwarding|permittunnel|permituserenvironment|maxauthtries|maxsessions|maxstartups|loglevel|clientaliveinterval|clientalivecountmax|usepam)[[:space:]]' || true
+  printf '\n--- configuration files ---\n'
+  ls -la /etc/ssh "$DROPIN_DIR" 2>/dev/null || true
+  printf '\n--- authorized_keys metadata ---\n'
+  find /root /home -xdev -type f \( -name authorized_keys -o -name authorized_keys2 \) -exec ls -ld {} \; 2>/dev/null || true
+  printf '\n--- service state ---\n'
+  if have_cmd systemctl && [ -d /run/systemd/system ]; then
+    printf 'active=%s enabled=%s\n' "$(systemctl is-active "$SERVICE" 2>/dev/null || printf unknown)" "$(systemctl is-enabled "$SERVICE" 2>/dev/null || printf unknown)"
+  else
+    rc-service "$SERVICE" status 2>/dev/null || service "$SERVICE" status 2>/dev/null || true
+  fi
+  printf '\n--- recent authentication event counts (values suppressed) ---\n'
+  if have_cmd journalctl; then
+    if have_cmd timeout; then
+      timeout -s TERM -k 2 10 journalctl --since '24 hours ago' -u ssh -u sshd --no-pager -n 300 2>/dev/null |
+        summarize_auth_events
+    else
+      journalctl --since '24 hours ago' -u ssh -u sshd --no-pager -n 300 2>/dev/null |
+        summarize_auth_events
+    fi
+  else
+    for _auth_log in /var/log/auth.log /var/log/secure; do
+      [ -f "$_auth_log" ] && tail -n 300 "$_auth_log"
+    done 2>/dev/null | summarize_auth_events
+  fi
+}
+
+has_viable_admin() {
+  [ -s "$SCRIPT_DIR/configs/admins.txt" ] || return 1
+  while IFS= read -r _admin || [ -n "$_admin" ]; do
+    _admin=$(printf '%s' "$_admin" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$_admin" ] || continue
+    _entry=$(getent passwd "$_admin" 2>/dev/null || awk -F: -v u="$_admin" '$1 == u {print; exit}' /etc/passwd)
+    [ -n "$_entry" ] || continue
+    _uid=$(printf '%s\n' "$_entry" | awk -F: '{print $3}')
+    _home=$(printf '%s\n' "$_entry" | awk -F: '{print $6}')
+    _shell=$(printf '%s\n' "$_entry" | awk -F: '{print $7}')
+    [ "$_uid" -ne 0 ] || continue
+    case "$_shell" in */nologin|*/false|'') continue ;; esac
+    _shadow=$(awk -F: -v u="$_admin" '$1 == u {print $2; exit}' /etc/shadow 2>/dev/null)
+    case "$_shadow" in ''|'!'*|'*'*) _password_ok=0 ;; *) _password_ok=1 ;; esac
+    if [ -s "$_home/.ssh/authorized_keys" ] || [ "$_password_ok" -eq 1 ]; then
       return 0
-    else
-      log_err "SSH configuration is INVALID!"
-      return 1
     fi
-  elif [ -x "$SSH_BINARY" ]; then
-    if "$SSH_BINARY" -t -f "$SSHD_CONFIG" 2>&1; then
-      log_info "SSH configuration is valid."
-      return 0
-    else
-      log_err "SSH configuration is INVALID!"
-      return 1
-    fi
-  else
-    log_warn "Cannot validate config - sshd not found"
-    return 0
-  fi
+  done <"$SCRIPT_DIR/configs/admins.txt"
+  return 1
 }
 
-# ==============================================================================
-# RESTART SSH SERVICE
-# ==============================================================================
-restart_ssh_service() {
-  log_info "Restarting SSH service..."
-
-  case "$INIT_SYS" in
-  smf)
-    log_info "Using Solaris SMF..."
-    svcadm restart "$SSH_SERVICE" || svcadm restart svc:/network/ssh:default
-
-    sleep 2
-    if svcs -p "$SSH_SERVICE" 2>/dev/null | grep -q "online"; then
-      log_info "SSH service is online (SMF)"
-    else
-      svcs -xv "$SSH_SERVICE"
-      log_warn "SSH service may not be running properly"
-    fi
-    ;;
-  systemd)
-    systemctl unmask "$SSH_SERVICE"
-    systemctl enable "$SSH_SERVICE"
-    systemctl restart "$SSH_SERVICE"
-
-    if systemctl is-active --quiet "$SSH_SERVICE"; then
-      log_info "SSH service is active (systemd)"
-    else
-      log_warn "SSH service may not be running"
-    fi
-    ;;
-  openrc)
-    rc-update add "$SSH_SERVICE" default
-    rc-service "$SSH_SERVICE" restart
-    ;;
-  sysv)
-    if [ -x "/etc/init.d/$SSH_SERVICE" ]; then
-      "/etc/init.d/$SSH_SERVICE" restart
-    fi
-    ;;
-  nodeos)
-    log_info "NodeOS: Restarting SSH manually..."
-    pkill -HUP sshd || true
-    if ! pgrep sshd >/dev/null; then
-      /usr/sbin/sshd || sshd
-    fi
-    ;;
-  esac
+restore_previous() {
+  log_warn 'Restoring previous SSH configuration'
+  [ -n "$MAIN_BACKUP" ] && [ -f "$MAIN_BACKUP" ] && cp -p "$MAIN_BACKUP" "$SSHD_CONFIG"
+  if [ "$DROPIN_EXISTED" -eq 1 ] && [ -f "$DROPIN_BACKUP" ]; then
+    cp -p "$DROPIN_BACKUP" "$DROPIN"
+  else
+    rm -f "$DROPIN"
+  fi
+  validate_config || log_error 'Restored SSH configuration does not validate'
+  reload_service || log_error 'Could not reload restored SSH configuration'
 }
 
-# ==============================================================================
-# SETUP AUTHORIZED KEYS FROM configs/authorized_keys
-# ==============================================================================
-setup_authorized_keys() {
-  _user="$1"
+printf '%s\n' 'Managed SSH directives:'
+sed -n '/^[[:space:]]*#/d; /^[[:space:]]*$/d; p' "$SOURCE_CONFIG"
 
-  if [ -z "$_user" ]; then
-    return
+case "$MODE" in
+  audit) audit_ssh; exit $? ;;
+  plan) exit 0 ;;
+esac
+
+[ "$YES" -eq 1 ] || die 'Apply requires --yes'
+
+if [ -n "${SSH_CONNECTION:-}" ]; then
+  _session_user=${SUDO_USER:-$(id -un 2>/dev/null || printf root)}
+  if { [ "$_session_user" = root ] || [ "$_session_user" = unknown ]; } &&
+     [ "$ALLOW_ROOT_LOCKOUT" -ne 1 ] && ! has_viable_admin; then
+    die 'Remote root session detected without a viable approved non-root admin; refusing potential lockout'
   fi
+fi
 
-  # Check if authorized_keys config exists
-  if [ ! -f "$SCRIPT_DIR/configs/authorized_keys" ]; then
-    log_warn "configs/authorized_keys not found, skipping"
-    return
-  fi
+validate_config || die 'Current SSH configuration is already invalid; repair it before applying hardening'
 
-  # Get user home directory
-  if command -v getent >/dev/null 2>&1; then
-    _home=$(getent passwd "$_user" 2>/dev/null | cut -d: -f6)
-  else
-    _home=$(grep "^${_user}:" /etc/passwd 2>/dev/null | cut -d: -f6)
-  fi
+STAMP=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d_%H%M%S')
+umask 077
+ROLLBACK_DIR=$(mktemp -d "/var/backups/ccdc-ssh-$STAMP.XXXXXX") || die "Cannot create SSH backup directory"
+chmod 700 "$ROLLBACK_DIR"
+MAIN_BACKUP="$ROLLBACK_DIR/sshd_config"
+DROPIN_BACKUP="$ROLLBACK_DIR/00-ccdc-hardening.conf"
+cp -p "$SSHD_CONFIG" "$MAIN_BACKUP" || die 'Cannot back up sshd_config'
+if [ -f "$DROPIN" ]; then
+  DROPIN_EXISTED=1
+  cp -p "$DROPIN" "$DROPIN_BACKUP" || die 'Cannot back up existing CCDC drop-in'
+fi
 
-  if [ -z "$_home" ] || [ ! -d "$_home" ]; then
-    log_warn "User '$_user' home directory not found"
-    return
-  fi
+mkdir -p "$DROPIN_DIR" || die "Cannot create $DROPIN_DIR"
+chmod 755 "$DROPIN_DIR"
 
-  log_info "Setting up authorized_keys for $_user..."
+TMP_MAIN=$(mktemp "${TMPDIR:-/tmp}/sshd-config.XXXXXX") || die 'Cannot create temporary file'
+TMP_DROPIN=$(mktemp "${TMPDIR:-/tmp}/sshd-dropin.XXXXXX") || { rm -f "$TMP_MAIN"; die 'Cannot create temporary file'; }
+trap 'rm -f "$TMP_MAIN" "$TMP_DROPIN"' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-  mkdir -p "${_home}/.ssh"
-  chmod 700 "${_home}/.ssh"
+# The first value for most sshd keywords wins. Put the managed include before
+# distribution defaults, and remove an identical later include to avoid parsing
+# the same drop-ins twice.
+{
+  printf '%s\n' "$INCLUDE_LINE"
+  grep -F -x -v "$INCLUDE_LINE" "$SSHD_CONFIG" || true
+} >"$TMP_MAIN"
+{
+  printf '%s\n' '# Managed by the CCDC Linux toolkit. Edit configs/sshd_config and re-apply.'
+  cat "$SOURCE_CONFIG"
+} >"$TMP_DROPIN"
 
-  cat "$SCRIPT_DIR/configs/authorized_keys" >"${_home}/.ssh/authorized_keys"
-  chmod 600 "${_home}/.ssh/authorized_keys"
+chmod 600 "$TMP_MAIN" "$TMP_DROPIN"
+chown root:root "$TMP_MAIN" "$TMP_DROPIN" 2>/dev/null || true
+cp -p "$TMP_MAIN" "$SSHD_CONFIG" || { restore_previous; die 'Could not install sshd_config include'; }
+cp -p "$TMP_DROPIN" "$DROPIN" || { restore_previous; die 'Could not install SSH hardening drop-in'; }
+rm -f "$TMP_MAIN" "$TMP_DROPIN"
+trap - 0 HUP INT TERM
 
-  # Set ownership
-  if command -v chown >/dev/null 2>&1; then
-    chown -R "${_user}" "${_home}/.ssh"
-    _group=$(id -gn "$_user" 2>/dev/null || echo "$_user")
-    chown -R "${_user}:${_group}" "${_home}/.ssh"
-  fi
-}
+if ! validate_config; then
+  restore_previous
+  die 'Hardened SSH configuration failed validation and was rolled back'
+fi
 
-# ==============================================================================
-# MAIN
-# ==============================================================================
-main() {
-  detect_ssh_paths
-  generate_host_keys
-  apply_sshd_config
+if ! reload_service; then
+  restore_previous
+  die 'SSH reload failed and the previous configuration was restored'
+fi
 
-  # Setup authorized keys for admin users from configs/admins.txt
-  if [ -f "$SCRIPT_DIR/configs/admins.txt" ]; then
-    log_info "Setting up authorized_keys for admins from configs/admins.txt"
-    while IFS= read -r admin || [ -n "$admin" ]; do
-      # Skip empty lines and comments
-      case "$admin" in
-      '' | \#*) continue ;;
-      esac
-      if id "$admin" >/dev/null 2>&1; then
-        setup_authorized_keys "$admin"
-      else
-        log_warn "Admin user '$admin' does not exist"
-      fi
-    done <"$SCRIPT_DIR/configs/admins.txt"
-  else
-    # Fallback: try common admin users
-    for user in cybear admin root; do
-      if id "$user" >/dev/null 2>&1; then
-        setup_authorized_keys "$user"
-      fi
-    done
-  fi
+if ! validate_config; then
+  restore_previous
+  die 'SSH configuration failed its post-reload check and was rolled back'
+fi
 
-  if validate_config; then
-    restart_ssh_service
-  else
-    log_err "Restoring backup due to invalid config..."
-    if ls "${SSHD_CONFIG}.bak."* >/dev/null 2>&1; then
-      cp "$(ls -t "${SSHD_CONFIG}.bak."* | head -1)" "$SSHD_CONFIG"
-    fi
-    exit 1
-  fi
+cat >"$ROLLBACK_DIR/README.txt" <<EOF
+To restore this SSH configuration with console access:
+  cp -p $MAIN_BACKUP $SSHD_CONFIG
 
-  log_info "SSH configuration complete!"
-}
+If this run replaced an existing managed drop-in:
+  cp -p $DROPIN_BACKUP $DROPIN
+Otherwise remove:
+  rm -f "$DROPIN"
 
-main "$@"
+Then run:
+  $SSHD_BIN -t -f $SSHD_CONFIG
+  systemctl reload $SERVICE
+EOF
+chmod 600 "$ROLLBACK_DIR"/* 2>/dev/null || true
+
+log_ok 'SSH hardening validated and reloaded; existing sessions were preserved'
+log_info "Rollback material: $ROLLBACK_DIR"

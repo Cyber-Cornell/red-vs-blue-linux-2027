@@ -1,0 +1,7 @@
+prometheus
+grafana
+alertmanager
+node_exporter
+snmp_exporter
+loki
+promtail

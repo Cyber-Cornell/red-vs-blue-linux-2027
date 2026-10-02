@@ -27,6 +27,9 @@ Desktop.ini
 # =========================
 shellcheck_report.txt
 shfmt_report.txt
+.firecrawl/
+reports/
+shell/reports/
 
 # If you add pre-commit or similar local tooling
 .pre-commit-config.local.yaml
@@ -122,3 +125,4 @@ coverage/
 lcov.info
 test-results/
 junit*.xml
+.omo/

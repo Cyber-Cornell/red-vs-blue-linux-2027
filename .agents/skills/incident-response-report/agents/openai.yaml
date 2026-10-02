@@ -1,0 +1,4 @@
+interface:
+  display_name: "Incident Response Report"
+  short_description: "Write evidence-grounded incident reports"
+  default_prompt: "Use $incident-response-report to draft an incident report for executive and technical readers from the supplied evidence."

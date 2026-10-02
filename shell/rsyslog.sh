@@ -1,177 +1,154 @@
 #!/bin/sh
-# ==============================================================================
-# Rsyslog Configuration Script
-# Supports: Linux (all distros), Solaris/illumos
-# Uses configs/rsyslog.conf when available
-# ==============================================================================
+# Add dedicated security log streams without replacing distribution rsyslog.
 
-set -e
+set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd)
+# shellcheck source=lib/portable.sh
+. "$SCRIPT_DIR/lib/portable.sh"
 
-# Source detection library
-if [ -f "$SCRIPT_DIR/lib/detect.sh" ]; then
-  . "$SCRIPT_DIR/lib/detect.sh"
-else
-  case "$(uname -s)" in
-  SunOS) OS_TYPE="solaris" ;;
-  Linux) OS_TYPE="linux" ;;
-  esac
+MODE=audit
+YES=0
+REMOTE=${CCDC_LOG_SERVER:-}
+SOURCE="$SCRIPT_DIR/configs/rsyslog.conf"
+DROPIN=/etc/rsyslog.d/90-ccdc.conf
+LOGROTATE=/etc/logrotate.d/ccdc-security
 
-  if [ -d /run/systemd/system ]; then
-    INIT_SYS="systemd"
-  elif command -v svcadm >/dev/null 2>&1; then
-    INIT_SYS="smf"
-  elif command -v rc-service >/dev/null 2>&1; then
-    INIT_SYS="openrc"
-  else
-    INIT_SYS="sysv"
-  fi
-fi
+usage() {
+  cat <<EOF
+Usage: $0 --audit | --plan | --apply --yes [--remote HOST[:PORT]]
 
-log_info() { printf "\033[0;32m[INFO]\033[0m %s\n" "$1"; }
-log_warn() { printf "\033[0;33m[WARN]\033[0m %s\n" "$1"; }
-log_err() { printf "\033[0;31m[ERROR]\033[0m %s\n" "$1" >&2; }
-
-if [ "$(id -u)" -ne 0 ]; then
-  log_err "This script must be run as root."
-  exit 1
-fi
-
-log_info "Starting rsyslog configuration..."
-log_info "Detected OS: $OS_TYPE, Init: $INIT_SYS"
-
-# ==============================================================================
-# SOLARIS SYSLOG
-# ==============================================================================
-configure_solaris_syslog() {
-  log_info "Configuring Solaris syslog..."
-
-  SYSLOG_CONF="/etc/syslog.conf"
-
-  if [ -f "$SYSLOG_CONF" ]; then
-    cp "$SYSLOG_CONF" "${SYSLOG_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-  fi
-
-  cat >"$SYSLOG_CONF" <<'EOF'
-# Solaris syslog configuration
-*.err;kern.notice;auth.notice                   /dev/sysmsg
-*.err;kern.debug;daemon.notice;mail.crit        /var/adm/messages
-
-*.alert;kern.err;daemon.err                     operator
-*.alert                                         root
-
-*.emerg                                         *
-
-auth.info                                       /var/log/authlog
-mail.debug                                      /var/log/syslog
-daemon.info                                     /var/log/daemon.log
-
-# Log all auth messages
-auth.*;authpriv.*                               /var/log/auth.log
+--remote forwards all events over TCP to an internal out-of-band collector.
+The receiver and competition rules must permit this traffic.
 EOF
-
-  chmod 644 "$SYSLOG_CONF"
-
-  # Create log directories
-  mkdir -p /var/log
-  touch /var/log/authlog /var/log/auth.log /var/log/daemon.log
-
-  # Restart syslog via SMF
-  log_info "Restarting Solaris syslog service..."
-  if svcs -a 2>/dev/null | grep -q "system-log"; then
-    svcadm restart system-log || svcadm restart svc:/system/system-log:default || true
-  fi
-
-  log_info "Solaris syslog configuration complete"
 }
 
-# ==============================================================================
-# LINUX RSYSLOG - Uses configs/rsyslog.conf
-# ==============================================================================
-configure_linux_rsyslog() {
-  log_info "Configuring Linux rsyslog..."
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --audit) MODE=audit ;;
+    --plan) MODE=plan ;;
+    --apply) MODE=apply ;;
+    --yes) YES=1 ;;
+    --remote)
+      shift
+      [ "$#" -gt 0 ] || die '--remote requires HOST[:PORT]'
+      REMOTE=$1
+      ;;
+    --remote=*) REMOTE=${1#*=} ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
+done
 
-  RSYSLOG_CONF="/etc/rsyslog.conf"
+require_root
+if [ "$MODE" != plan ] && ! have_cmd rsyslogd; then
+  if [ "$MODE" = audit ]; then log_warn 'rsyslog is not installed'; exit 0; fi
+  die 'rsyslogd is not installed'
+fi
 
-  # Check if rsyslog is installed
-  if ! command -v rsyslogd >/dev/null 2>&1; then
-    log_err "rsyslogd binary not found. Is rsyslog installed?"
-    exit 1
-  fi
+case "$REMOTE" in *[!A-Za-z0-9._:-]*) die "Invalid remote log destination: $REMOTE" ;; esac
 
-  # Backup existing config
-  if [ -f "$RSYSLOG_CONF" ]; then
-    cp "$RSYSLOG_CONF" "${RSYSLOG_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-  fi
-
-  # Apply rsyslog.conf from configs directory
-  if [ -f "$SCRIPT_DIR/configs/rsyslog.conf" ]; then
-    log_info "Using configs/rsyslog.conf"
-    cat "$SCRIPT_DIR/configs/rsyslog.conf" >"$RSYSLOG_CONF"
+audit_rsyslog() {
+  rsyslogd -N1 2>&1 || true
+  if have_cmd systemctl && [ -d /run/systemd/system ]; then
+    printf 'active=%s enabled=%s\n' "$(systemctl is-active rsyslog 2>/dev/null || printf unknown)" "$(systemctl is-enabled rsyslog 2>/dev/null || printf unknown)"
   else
-    log_err "configs/rsyslog.conf not found!"
-    exit 1
+    rc-service rsyslog status 2>/dev/null || service rsyslog status 2>/dev/null || true
   fi
-
-  chmod 644 "$RSYSLOG_CONF"
-
-  # Create necessary directories and log files
-  mkdir -p /var/lib/rsyslog
-  mkdir -p /var/log
-  touch /var/log/auth.log /var/log/syslog /var/log/kern.log \
-    /var/log/mail.log /var/log/cron.log /var/log/daemon.log /var/log/user.log
-  chmod 640 /var/log/*.log
-
-  # Restart rsyslog
-  SERVICE="rsyslog"
-
-  case "$INIT_SYS" in
-  systemd)
-    systemctl enable "$SERVICE"
-    systemctl restart "$SERVICE"
-
-    if systemctl is-active --quiet "$SERVICE"; then
-      log_info "rsyslog service is active"
-    else
-      log_err "rsyslog service failed to start"
-    fi
-    ;;
-  openrc)
-    rc-update add "$SERVICE" default
-    rc-service "$SERVICE" restart
-    ;;
-  sysv)
-    if command -v update-rc.d >/dev/null 2>&1; then
-      update-rc.d "$SERVICE" defaults
-    elif command -v chkconfig >/dev/null 2>&1; then
-      chkconfig "$SERVICE" on
-    fi
-    "/etc/init.d/$SERVICE" restart
-    ;;
-  esac
-
-  log_info "Linux rsyslog configuration complete"
+  for _log in /var/log/ccdc-auth.log /var/log/ccdc-kernel.log /var/log/ccdc-daemon.log; do
+    [ -f "$_log" ] || continue
+    _lines=$(wc -l <"$_log" 2>/dev/null || printf unknown)
+    _metadata=$(stat -c 'uid=%u gid=%g mode=%a size=%s mtime=%Y' "$_log" 2>/dev/null || printf metadata=unavailable)
+    printf '\nlog=%s lines=%s %s values_suppressed=yes\n' "$_log" "$_lines" "$_metadata"
+    sha256_file "$_log" 2>/dev/null || true
+  done
 }
 
-# ==============================================================================
-# MAIN
-# ==============================================================================
-main() {
-  case "$OS_TYPE" in
-  solaris)
-    configure_solaris_syslog
+case "$MODE" in
+  audit) audit_rsyslog; exit 0 ;;
+  plan)
+    cat "$SOURCE"
+    [ -n "$REMOTE" ] && printf '*.* @@%s;RSYSLOG_SyslogProtocol23Format\n' "$REMOTE"
+    exit 0
     ;;
-  linux)
-    configure_linux_rsyslog
-    ;;
-  *)
-    log_err "Unsupported OS: $OS_TYPE"
-    exit 1
-    ;;
-  esac
+esac
 
-  log_info "Rsyslog configuration complete!"
+[ "$YES" -eq 1 ] || die 'Apply requires --yes'
+[ -s "$SOURCE" ] || die "Missing $SOURCE"
+
+STAMP=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d_%H%M%S')
+umask 077
+mkdir -p /var/backups /etc/rsyslog.d /etc/logrotate.d || die 'Cannot create rsyslog directories'
+ROLLBACK_DIR=$(mktemp -d "/var/backups/ccdc-rsyslog-$STAMP.XXXXXX") || die 'Cannot create rollback directory'
+chmod 700 "$ROLLBACK_DIR"
+[ ! -L "$DROPIN" ] && [ ! -L "$LOGROTATE" ] || die 'Refusing symlinked logging configuration'
+DROPIN_EXISTED=0
+ROTATE_EXISTED=0
+if [ -f "$DROPIN" ]; then DROPIN_EXISTED=1; cp -p "$DROPIN" "$ROLLBACK_DIR/90-ccdc.conf"; fi
+if [ -f "$LOGROTATE" ]; then ROTATE_EXISTED=1; cp -p "$LOGROTATE" "$ROLLBACK_DIR/ccdc-security.logrotate"; fi
+restore_rsyslog() {
+  log_warn 'Restoring previous rsyslog configuration'
+  if [ "$DROPIN_EXISTED" -eq 1 ]; then cp -p "$ROLLBACK_DIR/90-ccdc.conf" "$DROPIN"; else rm -f "$DROPIN"; fi
+  if [ "$ROTATE_EXISTED" -eq 1 ]; then cp -p "$ROLLBACK_DIR/ccdc-security.logrotate" "$LOGROTATE"; else rm -f "$LOGROTATE"; fi
+  systemctl restart rsyslog 2>/dev/null || rc-service rsyslog restart 2>/dev/null || service rsyslog restart 2>/dev/null || true
 }
+on_exit() {
+  _result=$?
+  trap - 0
+  if [ "$_result" -ne 0 ]; then restore_rsyslog; fi
+  exit "$_result"
+}
+trap on_exit 0
+trap 'exit 1' HUP INT TERM
 
-main "$@"
+{
+  cat "$SOURCE"
+  if [ -n "$REMOTE" ]; then
+    printf '\n# Internal out-of-band forwarding requested by the operator.\n'
+    printf '*.* @@%s;RSYSLOG_SyslogProtocol23Format\n' "$REMOTE"
+  fi
+} >"$DROPIN"
+cat >"$LOGROTATE" <<'EOF'
+/var/log/ccdc-auth.log /var/log/ccdc-kernel.log /var/log/ccdc-daemon.log {
+    daily
+    rotate 7
+    size 25M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /bin/systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || /usr/bin/pkill -HUP -x rsyslogd >/dev/null 2>&1 || true
+    endscript
+}
+EOF
+chown root:root "$DROPIN" "$LOGROTATE" 2>/dev/null || true
+chmod 640 "$DROPIN" "$LOGROTATE"
+
+if ! rsyslogd -N1; then
+  die 'rsyslog validation failed; previous state restored'
+fi
+if have_cmd systemctl && [ -d /run/systemd/system ]; then
+  systemctl restart rsyslog || { restore_rsyslog; die 'rsyslog restart failed; previous state restored'; }
+  systemctl is-active --quiet rsyslog || { restore_rsyslog; die 'rsyslog is not active; previous state restored'; }
+elif have_cmd rc-service; then
+  rc-service rsyslog restart || { restore_rsyslog; die 'rsyslog restart failed; previous state restored'; }
+  rc-service rsyslog status || die 'rsyslog is not running'
+else
+  service rsyslog restart || { restore_rsyslog; die 'rsyslog restart failed; previous state restored'; }
+fi
+
+VERIFY_EVENT="CCDC-security-logging-check-$$-$STAMP"
+logger -p auth.notice -t ccdc-toolkit "$VERIFY_EVENT" || die 'Cannot emit logging verification event'
+sleep 1
+grep -Fq "$VERIFY_EVENT" /var/log/ccdc-auth.log || die 'Verification event did not reach the managed auth log'
+cat >"$ROLLBACK_DIR/README.txt" <<EOF
+Restore or remove $DROPIN and $LOGROTATE according to the backup files in this
+directory, validate with "rsyslogd -N1", then restart rsyslog.
+EOF
+chmod 600 "$ROLLBACK_DIR"/* 2>/dev/null || true
+log_ok 'Dedicated, rotated security logs are active'
+[ -n "$REMOTE" ] && log_info "Forwarding all events over TCP to $REMOTE"
+log_info "Rollback material: $ROLLBACK_DIR"

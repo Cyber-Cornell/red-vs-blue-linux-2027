@@ -1,0 +1,200 @@
+---
+- name: Run CCDC Linux toolkit
+  hosts: ccdc_linux
+  gather_facts: false
+  become: "{{ ccdc_become | default(true) | bool }}"
+  serial: "{{ ccdc_serial | default(1) }}"
+  tasks:
+    - name: Resolve operator options
+      ansible.builtin.set_fact:
+        ccdc_action: "{{ ccdc_action | default('check') }}"
+        ccdc_stage_dir: "{{ ccdc_stage_dir | default('/opt/ccdc-blue') }}"
+        ccdc_stage_owner: "{{ ccdc_stage_owner | default('root') }}"
+        ccdc_stage_group: "{{ ccdc_stage_group | default('root') }}"
+        ccdc_output_dir: "{{ ccdc_output_dir | default('') }}"
+        ccdc_apply_targets: "{{ ccdc_apply_targets | default([]) }}"
+        ccdc_plan_targets: "{{ ccdc_plan_targets | default([]) }}"
+        ccdc_tcp_ports: "{{ ccdc_tcp_ports | default('') }}"
+        ccdc_udp_ports: "{{ ccdc_udp_ports | default('') }}"
+        ccdc_confirm_apply: "{{ ccdc_confirm_apply | default(false) }}"
+        ccdc_backup_profile: "{{ ccdc_backup_profile | default('') }}"
+        ccdc_backup_sources: "{{ ccdc_backup_sources | default([]) }}"
+        ccdc_backup_output: "{{ ccdc_backup_output | default('') }}"
+        ccdc_backup_max_mb: "{{ ccdc_backup_max_mb | default(256) }}"
+        ccdc_tool: "{{ ccdc_tool | default('') }}"
+        ccdc_tool_args: "{{ ccdc_tool_args | default([]) }}"
+        ccdc_confirm_tool: "{{ ccdc_confirm_tool | default(false) }}"
+        ccdc_tool_changes: "{{ ccdc_tool_changes | default(false) }}"
+        ccdc_show_tool_output: "{{ ccdc_show_tool_output | default(false) }}"
+        ccdc_fetch_results: "{{ ccdc_fetch_results | default(false) }}"
+        ccdc_local_results_dir: "{{ ccdc_local_results_dir | default('./ccdc-results') }}"
+
+    - name: Validate requested operation and paths
+      ansible.builtin.assert:
+        that:
+          - ccdc_action in ['check', 'plan', 'audit', 'hunt', 'apply', 'backup', 'tool']
+          - ccdc_stage_dir is match('^/[A-Za-z0-9/_-]+$')
+          - ccdc_stage_owner is match('^[A-Za-z_][A-Za-z0-9_-]*$')
+          - ccdc_stage_group is match('^[A-Za-z_][A-Za-z0-9_-]*$')
+          - ccdc_output_dir == '' or ccdc_output_dir is match('^/[^\n\r]+$')
+          - ccdc_apply_targets is sequence and ccdc_apply_targets is not string
+          - ccdc_plan_targets is sequence and ccdc_plan_targets is not string
+          - ccdc_tool_args is sequence and ccdc_tool_args is not string
+          - ccdc_backup_sources is sequence and ccdc_backup_sources is not string
+          - ccdc_apply_targets | reject('match', '^[A-Za-z][A-Za-z0-9-]*$') | list | length == 0
+          - ccdc_plan_targets | reject('match', '^[A-Za-z][A-Za-z0-9-]*$') | list | length == 0
+          - ccdc_action != 'apply' or (ccdc_confirm_apply | bool and ccdc_apply_targets | length > 0)
+          - ccdc_action != 'backup' or (ccdc_backup_output is match('^/[^\n\r]+$') and (ccdc_backup_profile in ['configs', 'critical'] or ccdc_backup_sources | length > 0))
+          - ccdc_action != 'tool' or (ccdc_confirm_tool | bool and ccdc_tool is match('^[A-Za-z0-9_/-]+[.]sh$') and '..' not in ccdc_tool and not ccdc_tool.startswith('/'))
+          - not (ccdc_fetch_results | bool) or (ccdc_action in ['audit', 'hunt', 'apply'] and ccdc_output_dir | length > 0)
+        fail_msg: Review the Ansible action, target list, confirmation and absolute paths.
+
+    - name: Validate backup source paths and size
+      ansible.builtin.assert:
+        that:
+          - ccdc_backup_profile in ['', 'configs', 'critical']
+          - ccdc_backup_max_mb | int >= 1
+          - ccdc_backup_max_mb | int <= 4096
+          - ccdc_backup_sources | reject('match', '^/[^\n\r]+$') | list | length == 0
+      when: ccdc_action == 'backup'
+
+    - name: Inspect remote staging parent
+      ansible.builtin.stat:
+        path: "{{ ccdc_stage_dir }}"
+        follow: false
+      register: ccdc_stage_parent
+
+    - name: Require a real staging parent when it already exists
+      ansible.builtin.assert:
+        that:
+          - not ccdc_stage_parent.stat.exists or (ccdc_stage_parent.stat.isdir and not ccdc_stage_parent.stat.islnk)
+        fail_msg: The staging parent must be a real directory, not a file or symlink.
+
+    - name: Create private remote staging parent
+      ansible.builtin.file:
+        path: "{{ ccdc_stage_dir }}"
+        state: directory
+        owner: "{{ ccdc_stage_owner }}"
+        group: "{{ ccdc_stage_group }}"
+        mode: '0700'
+      when: not ccdc_stage_parent.stat.exists
+
+    - name: Allocate a fresh per-run staging directory
+      ansible.builtin.tempfile:
+        path: "{{ ccdc_stage_dir }}"
+        prefix: .ccdc-run-
+        state: directory
+      register: ccdc_temp_stage
+      when: not ansible_check_mode
+
+    - name: Protect the per-run staging directory
+      ansible.builtin.file:
+        path: "{{ ccdc_temp_stage.path }}"
+        state: directory
+        owner: "{{ ccdc_stage_owner }}"
+        group: "{{ ccdc_stage_group }}"
+        mode: '0700'
+      when: not ansible_check_mode
+
+    - name: Select the real per-run staging directory
+      ansible.builtin.set_fact:
+        ccdc_run_dir: "{{ ccdc_temp_stage.path }}"
+      when: not ansible_check_mode
+
+    - name: Select the check-mode staging preview
+      ansible.builtin.set_fact:
+        ccdc_run_dir: "{{ ccdc_stage_dir }}/.ccdc-check-mode"
+      when: ansible_check_mode
+
+    - name: Stage toolkit scripts and configuration
+      ansible.builtin.copy:
+        src: ../../shell/
+        dest: "{{ ccdc_run_dir }}/shell/"
+        owner: "{{ ccdc_stage_owner }}"
+        group: "{{ ccdc_stage_group }}"
+        mode: '0600'
+        directory_mode: '0700'
+
+    - name: Build read-only and apply command
+      ansible.builtin.set_fact:
+        ccdc_argv: >-
+          {{ ['/bin/sh', ccdc_run_dir ~ '/shell/setup.sh', ccdc_action]
+             + ((ccdc_plan_targets if ccdc_action == 'plan' else ccdc_apply_targets) | list if ccdc_action in ['plan', 'apply'] else [])
+             + (['--yes'] if ccdc_action == 'apply' else [])
+             + (['--tcp-ports', ccdc_tcp_ports | string] if ccdc_action == 'apply' and ccdc_tcp_ports | length > 0 else [])
+             + (['--udp-ports', ccdc_udp_ports | string] if ccdc_action == 'apply' and ccdc_udp_ports | length > 0 else [])
+             + (['--output', ccdc_output_dir] if ccdc_action in ['audit', 'hunt', 'apply'] and ccdc_output_dir | length > 0 else []) }}
+      when: ccdc_action in ['check', 'plan', 'audit', 'hunt', 'apply']
+
+    - name: Build backup command
+      ansible.builtin.set_fact:
+        ccdc_argv: >-
+          {{ ['/bin/sh', ccdc_run_dir ~ '/shell/setup.sh', 'backup']
+             + (['--profile', ccdc_backup_profile] if ccdc_backup_profile | length > 0 else [])
+          }}
+      when: ccdc_action == 'backup'
+
+    - name: Add each backup source as one argument
+      ansible.builtin.set_fact:
+        ccdc_argv: "{{ ccdc_argv + ['--source', item] }}"
+      loop: "{{ ccdc_backup_sources }}"
+      when: ccdc_action == 'backup'
+
+    - name: Add backup output and size limit
+      ansible.builtin.set_fact:
+        ccdc_argv: "{{ ccdc_argv + ['--output', ccdc_backup_output, '--max-mb', ccdc_backup_max_mb | string] }}"
+      when: ccdc_action == 'backup'
+
+    - name: Build individual script command
+      ansible.builtin.set_fact:
+        ccdc_argv: "{{ ['/bin/sh', ccdc_run_dir ~ '/shell/' ~ ccdc_tool] + ccdc_tool_args | list }}"
+      when: ccdc_action == 'tool'
+
+    - name: Preview the selected apply stages
+      ansible.builtin.command:
+        argv: "{{ ['/bin/sh', ccdc_run_dir ~ '/shell/setup.sh', 'plan'] + ccdc_apply_targets | list }}"
+      register: ccdc_plan_result
+      changed_when: false
+      when: ccdc_action == 'apply' and not ansible_check_mode
+
+    - name: Show apply plan
+      ansible.builtin.debug:
+        var: ccdc_plan_result.stdout_lines
+      when: ccdc_action == 'apply' and not ansible_check_mode
+
+    - name: Run selected toolkit operation
+      ansible.builtin.command:
+        argv: "{{ ccdc_argv }}"
+        chdir: "{{ ccdc_run_dir }}/shell"
+      register: ccdc_result
+      changed_when: (ccdc_action in ['apply', 'backup'] or (ccdc_action == 'tool' and ccdc_tool_changes | bool)) and ccdc_result.rc == 0
+      failed_when: false
+      no_log: "{{ ccdc_action == 'backup' or (ccdc_action == 'tool' and not ccdc_show_tool_output | bool) }}"
+      when: not ansible_check_mode
+
+    - name: Remove the per-run toolkit staging directory
+      ansible.builtin.file:
+        path: "{{ ccdc_run_dir }}"
+        state: absent
+      when: not ansible_check_mode
+
+    - name: Fetch small stage status file when requested
+      ansible.builtin.fetch:
+        src: "{{ ccdc_output_dir }}/results.tsv"
+        dest: "{{ ccdc_local_results_dir }}/{{ inventory_hostname }}-{{ ccdc_action }}-results.tsv"
+        flat: true
+      when: not ansible_check_mode and ccdc_fetch_results | bool and ccdc_result.rc == 0
+
+    - name: Show toolkit result
+      ansible.builtin.debug:
+        msg:
+          rc: "{{ ccdc_result.rc }}"
+          stdout: "{{ ccdc_result.stdout_lines }}"
+          stderr: "{{ ccdc_result.stderr_lines }}"
+      when: not ansible_check_mode and (ccdc_action not in ['backup', 'tool'] or (ccdc_action == 'tool' and ccdc_show_tool_output | bool))
+
+    - name: Require successful toolkit exit
+      ansible.builtin.assert:
+        that: ccdc_result.rc == 0
+        fail_msg: The toolkit returned a nonzero exit; review its remote output and logs.
+      when: not ansible_check_mode

@@ -1,236 +1,235 @@
 #!/bin/sh
+# Review accounts and lock only names explicitly approved by an operator.
+# This script deliberately does not create users, replace PAM, rewrite sudoers,
+# or infer that every unlisted account is malicious.
 
-LOGFILE="error_log.txt"
+set -u
 
-# Preserve original stdout for progress messages
-exec 3>&1
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd)
+CONFIG_DIR="$SCRIPT_DIR/../configs"
+# shellcheck source=../lib/portable.sh
+. "$SCRIPT_DIR/../lib/portable.sh"
 
-# Suppress all stdout, append all stderr to log
-exec 1>/dev/null
-exec 2>>"$LOGFILE"
+MODE=audit
+YES=0
+TERMINATE=0
+ADMINS_FILE="$CONFIG_DIR/admins.txt"
+USERS_FILE="$CONFIG_DIR/users.txt"
+SERVICES_FILE="$CONFIG_DIR/services.txt"
+LOCK_FILE="$CONFIG_DIR/lock_accounts.txt"
+WORK_DIR=''
 
-progress() {
-  printf '%s\n' "$1" >&3
+usage() {
+  cat <<EOF
+Usage:
+  $0 [--audit]
+  $0 --apply --yes [--terminate-sessions]
+
+Review inputs:
+  $ADMINS_FILE
+  $USERS_FILE
+  $SERVICES_FILE
+  $LOCK_FILE
+
+Audit reports accounts that need human review. Apply locks only accounts named
+in lock_accounts.txt. It refuses root, UID 0, allowlisted, and active-session
+accounts. --terminate-sessions makes active-session accounts eligible and kills
+their processes after the lock is applied.
+EOF
 }
 
-progress "Starting account and PAM configuration..."
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --audit) MODE=audit ;;
+    --apply) MODE=apply ;;
+    --yes) YES=1 ;;
+    --terminate-sessions) TERMINATE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
+done
 
-if [ "$(id -u || true)" -ne 0 ]; then
-  progress "ERROR: Must be run as root"
-  exit 1
-fi
+[ "$MODE" != apply ] || [ "$YES" -eq 1 ] || die "Apply requires --yes"
+require_root
+[ "$(uname -s 2>/dev/null)" = Linux ] || die "Account workflow supports Linux only"
 
-progress "Creating required configuration directories..."
-mkdir -p /etc/pam.d /etc/security /etc/bash
-
-progress "Installing system configuration files..."
-cat configs/login.defs >/etc/login.defs
-cat configs/common-password >/etc/pam.d/common-password
-cat configs/common-auth >/etc/pam.d/common-auth
-cat configs/common-account >/etc/pam.d/common-account
-cat configs/pwquality.conf >/etc/security/pwquality.conf
-cat configs/limits.conf >/etc/security/limits.conf
-cat configs/sudo.conf >/etc/sudo.conf
-cat configs/sudoers >/etc/sudoers
-cat configs/bashrc >/etc/bash/bashrc
-cat configs/etc_profile >/etc/profile
-cat configs/.bashrc >/root/.bashrc
-
-# --- 1. Helper Functions for portability ---
-
-# Check if a group exists (Support getent or /etc/group)
-group_exists() {
-  if command -v getent >/dev/null 2>&1; then
-    getent group "$1" >/dev/null 2>&1
-  else
-    grep -q "^$1:" /etc/group
+cleanup() {
+  if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+    rm -f "$WORK_DIR"/* 2>/dev/null || true
+    rmdir "$WORK_DIR" 2>/dev/null || true
   fi
 }
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ccdc-accounts.XXXXXX") || die 'Cannot create temporary directory'
+ALLOWLIST="$WORK_DIR/allowlist"
+: >"$ALLOWLIST"
 
-# Check if a GID is currently in use
-gid_is_taken() {
-  if command -v getent >/dev/null 2>&1; then
-    getent group "$1" >/dev/null 2>&1
-  else
-    # Extract 3rd field (GID) and match exact line
-    cut -d: -f3 /etc/group | grep -q "^$1$"
-  fi
+valid_name() {
+  case "$1" in
+    ''|*[!A-Za-z0-9_.-]*|[0-9-]*) return 1 ;;
+  esac
+  return 0
 }
 
-# --- 2. Detect Creation Tool ---
-if command -v groupadd >/dev/null 2>&1; then
-  # Standard Linux (RHEL, Debian, CentOS, etc.)
-  CMD="groupadd"
-  FLAG="-g"
-elif command -v addgroup >/dev/null 2>&1; then
-  # Alpine / BusyBox
-  CMD="addgroup"
-  FLAG="-g"
-else
-  echo "Error: Could not find 'groupadd' or 'addgroup'." >&2
-  exit 1
-fi
+read_config() {
+  _config=$1
+  _destination=$2
+  [ -f "$_config" ] || return 0
+  while IFS= read -r _name || [ -n "$_name" ]; do
+    _name=$(printf '%s' "$_name" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$_name" ] || continue
+    valid_name "$_name" || die "Invalid account name in $_config: $_name"
+    printf '%s\n' "$_name" >>"$_destination"
+  done <"$_config"
+}
 
-# --- 3. Main Logic ---
+read_config "$ADMINS_FILE" "$ALLOWLIST"
+read_config "$USERS_FILE" "$ALLOWLIST"
+read_config "$SERVICES_FILE" "$ALLOWLIST"
+LC_ALL=C sort -u "$ALLOWLIST" -o "$ALLOWLIST"
 
-ensure_group() {
-  GRP_NAME="$1"
-  PREFERRED_GID="$2"
+is_allowed() { grep -F -x "$1" "$ALLOWLIST" >/dev/null 2>&1; }
 
-  if group_exists "$GRP_NAME"; then
-    echo "Group '$GRP_NAME' already exists."
-    return 0
+is_interactive_shell() {
+  case "$1" in
+    ''|*/nologin|*/false|*/sync|*/shutdown|*/halt) return 1 ;;
+  esac
+  return 0
+}
+
+password_state() {
+  _entry=$(awk -F: -v u="$1" '$1 == u {print $2; exit}' /etc/shadow 2>/dev/null)
+  case "$_entry" in
+    '') printf empty ;;
+    '!'*|'*'*) printf locked ;;
+    *) printf set ;;
+  esac
+}
+
+has_session() {
+  who 2>/dev/null | awk '{print $1}' | grep -F -x "$1" >/dev/null 2>&1
+}
+
+audit_accounts() {
+  printf '%-22s %-7s %-11s %-10s %-10s %s\n' USER UID APPROVED PASSWORD LOGIN_SHELL HOME
+  printf '%-22s %-7s %-11s %-10s %-10s %s\n' ---- --- -------- -------- ----------- ----
+
+  while IFS=: read -r _user _pw _uid _gid _gecos _home _shell; do
+    _approved=no
+    is_allowed "$_user" && _approved=yes
+    _login=no
+    is_interactive_shell "$_shell" && _login=yes
+    _state=$(password_state "$_user")
+    printf '%-22s %-7s %-11s %-10s %-10s %s\n' "$_user" "$_uid" "$_approved" "$_state" "$_login" "$_home"
+
+    if [ "$_uid" -eq 0 ] && [ "$_user" != root ]; then
+      printf '[CRITICAL] UID 0 account other than root: %s\n' "$_user" >&2
+    fi
+    if [ "$_state" = empty ]; then
+      printf '[CRITICAL] Empty password field: %s\n' "$_user" >&2
+    fi
+    if [ "$_approved" = no ] && { [ "$_uid" -ge 1000 ] 2>/dev/null || is_interactive_shell "$_shell"; }; then
+      printf '[REVIEW] Unapproved interactive or human-range account: %s (uid=%s shell=%s)\n' \
+        "$_user" "$_uid" "$_shell" >&2
+    fi
+  done </etc/passwd
+
+  while IFS= read -r _approved_user || [ -n "$_approved_user" ]; do
+    [ -n "$_approved_user" ] || continue
+    id "$_approved_user" >/dev/null 2>&1 ||
+      printf '[REVIEW] Approved account does not exist on this host: %s\n' "$_approved_user" >&2
+  done <"$ALLOWLIST"
+
+  log_info 'Audit only: add a reviewed name to configs/lock_accounts.txt before apply'
+}
+
+lock_account() {
+  _user=$1
+  _record=$(getent passwd "$_user" 2>/dev/null || awk -F: -v u="$_user" '$1 == u {print; exit}' /etc/passwd)
+  [ -n "$_record" ] || { log_warn "Account does not exist: $_user"; return 0; }
+  _uid=$(printf '%s\n' "$_record" | awk -F: '{print $3}')
+  _shell=$(printf '%s\n' "$_record" | awk -F: '{print $7}')
+
+  [ "$_user" != root ] || { log_error 'Refusing to lock root'; return 1; }
+  [ "$_uid" -ne 0 ] || { log_error "Refusing to lock UID 0 account: $_user"; return 1; }
+  if is_allowed "$_user"; then
+    log_error "Refusing to lock allowlisted account: $_user"
+    return 1
+  fi
+  if [ "$_user" = "${SUDO_USER:-}" ] || [ "$_user" = "${LOGNAME:-}" ]; then
+    log_error "Refusing current operator account: $_user"
+    return 1
+  fi
+  if has_session "$_user" && [ "$TERMINATE" -ne 1 ]; then
+    log_error "Refusing active-session account $_user; review it and use --terminate-sessions if intended"
+    return 1
   fi
 
-  echo "Creating group '$GRP_NAME'..."
-
-  # Check if we should try to force the GID
-  if [ -n "$PREFERRED_GID" ]; then
-    if ! gid_is_taken "$PREFERRED_GID"; then
-      # GID is free, use it
-      $CMD $FLAG "$PREFERRED_GID" "$GRP_NAME"
+  printf '%s\n' "$_record" >>"$LEDGER"
+  if have_cmd usermod; then
+    usermod -L "$_user" || return 1
+    usermod -e 1 "$_user" || return 1
+    if [ -x /usr/sbin/nologin ]; then
+      usermod -s /usr/sbin/nologin "$_user" || return 1
+    elif [ -x /sbin/nologin ]; then
+      usermod -s /sbin/nologin "$_user" || return 1
     else
-      echo "  Warning: Standard GID $PREFERRED_GID is already taken."
-      echo "  Creating '$GRP_NAME' with next available system GID."
-      $CMD "$GRP_NAME"
+      usermod -s /bin/false "$_user" || return 1
     fi
   else
-    # No specific GID requested
-    $CMD "$GRP_NAME"
+    passwd -l "$_user" || return 1
+    log_error "usermod is unavailable; password locked but shell $_shell was not changed"
+    return 1
   fi
 
-  # Validation
-  if group_exists "$GRP_NAME"; then
-    echo "  Successfully created '$GRP_NAME'."
-  else
-    echo "  Error: Failed to create group." >&2
+  if [ "$TERMINATE" -eq 1 ]; then
+    pkill -KILL -u "$_uid" 2>/dev/null || true
   fi
+  log_ok "Locked explicitly reviewed account: $_user"
 }
 
-echo "Checking system groups..."
+if [ "$MODE" = audit ]; then
+  audit_accounts
+  exit 0
+fi
 
-# 1. ADM (Standard GID 4)
-# Used for system monitoring/log reading.
-ensure_group "adm" 4
+[ "$YES" -eq 1 ] || die 'Apply requires --yes'
+[ -f "$LOCK_FILE" ] || die "Missing $LOCK_FILE"
+LOCKS="$WORK_DIR/locks"
+: >"$LOCKS"
+read_config "$LOCK_FILE" "$LOCKS"
+LC_ALL=C sort -u "$LOCKS" -o "$LOCKS"
+[ -s "$LOCKS" ] || die 'lock_accounts.txt has no reviewed account names; nothing was changed'
 
-# 2. WHEEL (Standard GID 10)
-# Used for Administration on RHEL/BSD/Alpine.
-ensure_group "wheel" 10
+STAMP=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d_%H%M%S')
+umask 077
+ROLLBACK_DIR=$(mktemp -d "/var/backups/ccdc-accounts-$STAMP.XXXXXX") || die "Cannot create account backup directory"
+chmod 700 "$ROLLBACK_DIR"
+cp -p /etc/passwd /etc/shadow "$ROLLBACK_DIR/" || die 'Cannot back up account databases'
+LEDGER="$ROLLBACK_DIR/locked-passwd-records.txt"
+: >"$LEDGER"
+chmod 600 "$ROLLBACK_DIR"/*
 
-# 3. SUDO (Standard GID 27)
-# Used for Administration on Debian/Ubuntu.
-ensure_group "sudo" 27
+FAILURES=0
+while IFS= read -r _target || [ -n "$_target" ]; do
+  lock_account "$_target" || FAILURES=$((FAILURES + 1))
+done <"$LOCKS"
 
-echo "Finished group verification."
+cat >"$ROLLBACK_DIR/README.txt" <<EOF
+Account state before this run is in passwd and shadow. Compare individual
+entries before restoring. For an intentionally restored account, use:
+  usermod -U USER
+  usermod -e '' USER
+  usermod -s PREVIOUS_SHELL USER
 
-progress "Creating standard user accounts..."
-while IFS= read -r user; do
-  [ -n "$user" ] || continue
+Previous passwd records for accounts changed by the run are in:
+  $LEDGER
+EOF
+chmod 600 "$ROLLBACK_DIR/README.txt"
 
-  useradd -m "$user"
-  usermod -s /bin/bash "$user"
-  usermod -rG adm "$user"
-  usermod -rG sudo "$user"
-  usermod -rG wheel "$user"
-  chage -M 15 -m 6 -W 7 -I 5 "$user"
-
-  cat configs/.bashrc >/home/"$user"/.bashrc
-done <configs/users.txt
-
-progress "Creating administrative accounts..."
-while IFS= read -r admin; do
-  [ -n "$admin" ] || continue
-
-  useradd -m "$admin"
-  usermod -s /bin/bash "$admin"
-  usermod -aG adm "$admin"
-  usermod -aG sudo "$admin"
-  usermod -aG wheel "$admin"
-  chage -M 15 -m 6 -W 7 -I 5 "$admin"
-
-  cat configs/.bashrc >/home/"$admin"/.bashrc
-done <configs/admins.txt
-
-progress "Building whitelist..."
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-CONFIG_DIR="$SCRIPT_DIR/../configs"
-
-WHITELIST_TMP="/tmp/wl_$$"
-: >"$WHITELIST_TMP"
-
-[ -f "$CONFIG_DIR/admins.txt" ] && cat "$CONFIG_DIR/admins.txt" >>"$WHITELIST_TMP"
-[ -f "$CONFIG_DIR/users.txt" ] && cat "$CONFIG_DIR/users.txt" >>"$WHITELIST_TMP"
-[ -f "$CONFIG_DIR/services.txt" ] && cat "$CONFIG_DIR/services.txt" >>"$WHITELIST_TMP"
-
-freeze_target() {
-  u="$1"
-
-  passwd -l "$u"
-
-  if command -v chage >/dev/null 2>&1; then
-    chage -E 0 "$u"
-  else
-    usermod -e 1 "$u"
-  fi
-
-  if [ -f /sbin/nologin ]; then
-    usermod -s /sbin/nologin "$u"
-  else
-    usermod -s /bin/false "$u"
-  fi
-
-  pkill -KILL -u "$u"
-  killall -KILL -u "$u"
-
-  home_dir=$(grep "^$u:" /etc/passwd | cut -d: -f6)
-  if [ -d "$home_dir/.ssh" ]; then
-    mv "$home_dir/.ssh" "$home_dir/.ssh_quarantined_$$"
-  fi
-}
-
-progress "Auditing existing accounts..."
-while IFS= read -r line; do
-  USERNAME=$(printf '%s\n' "$line" | cut -d: -f1)
-  UID_NUM=$(printf '%s\n' "$line" | cut -d: -f3)
-  SHELL=$(printf '%s\n' "$line" | cut -d: -f7)
-
-  # SAFETY: root and nobody
-  [ "$UID_NUM" -eq 0 ] && continue
-  [ "$UID_NUM" -eq 65534 ] && continue
-
-  # SAFETY: infrastructure users
-  case "$USERNAME" in
-  sync | shutdown | halt | reboot | operator) continue ;;
-  esac
-
-  # SAFETY: whitelist
-  grep -Fxq "$USERNAME" "$WHITELIST_TMP" && continue
-
-  # Freeze normal users not whitelisted
-  if [ "$UID_NUM" -ge 1000 ]; then
-    freeze_target "$USERNAME"
-    continue
-  fi
-
-  SHADOW_ENTRY=$(grep "^$USERNAME:" /etc/shadow 2>/dev/null | cut -d: -f2)
-  HAS_PASSWORD="No"
-  case "$SHADOW_ENTRY" in
-  "" | !*) HAS_PASSWORD="No" ;;
-  *) HAS_PASSWORD="YES" ;;
-  esac
-
-  HAS_SHELL="No"
-  case "$SHELL" in
-  */bash | */sh | */zsh | */dash | */ksh | */csh | */tcsh | */ash | */fish)
-    HAS_SHELL="YES"
-    ;;
-  esac
-
-  if [ "$HAS_SHELL" = "YES" ] || [ "$HAS_PASSWORD" = "YES" ]; then
-    freeze_target "$USERNAME"
-  fi
-done </etc/passwd
-
-rm -f "$WHITELIST_TMP"
-
-progress "Account lockdown and configuration complete."
+log_info "Rollback material: $ROLLBACK_DIR"
+[ "$FAILURES" -eq 0 ] || die "$FAILURES account(s) could not be locked safely"

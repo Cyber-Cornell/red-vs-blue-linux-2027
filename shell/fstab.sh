@@ -1,17 +1,10 @@
 #!/bin/sh
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "This script must be run as root."
-  exit 1
-fi
-
-echo "Starting fstab configuration..."
-
-echo "Step 1: Securing temporary filesystems in fstab..."
-{
-  echo "tmpfs /run/shm tmpfs defaults,nodev,noexec,nosuid 0 0"
-  echo "tmpfs /tmp tmpfs defaults,rw,nosuid,nodev,noexec,relatime 0 0"
-  echo "tmpfs /var/tmp tmpfs defaults,nodev,noexec,nosuid 0 0"
-} >>/etc/fstab
-
-echo "Finished fstab configuration."
+set -u
+case "${1:---audit}" in
+  --audit|--plan) ;;
+  --help|-h) printf 'Usage: %s [--audit|--plan]\n' "$0"; exit 0 ;;
+  *) printf '%s\n' 'Automatic fstab mutation is refused. Review mount dependencies before changing policy.' >&2; exit 1 ;;
+esac
+[ "$#" -le 1 ] || exit 1
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
+exec sh "$SCRIPT_DIR/tools/mount_audit.sh"

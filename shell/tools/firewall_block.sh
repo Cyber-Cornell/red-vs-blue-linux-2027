@@ -1,74 +1,51 @@
 #!/bin/sh
-
-# ==============================================================================
-# Script Name: block_ip.sh
-# Description: Blocks a specific IPv4 address and saves rules using
-#              detected OS paths (Debian/Ubuntu vs RHEL/CentOS style).
-# Usage:       sudo ./block_ip.sh <IP_ADDRESS>
-# ==============================================================================
-
-# 1. Root Privilege Check
-if [ "$(id -u)" -ne 0 ]; then
-  printf "Error: This script must be run as root.\n" >&2
-  exit 1
+set -u
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd) || exit 1
+. "$SCRIPT_DIR/../lib/portable.sh"
+case "${0##*/}" in firewall_unblock.sh) ACTION=unblock ;; *) ACTION=block ;; esac
+MODE=plan
+YES=0
+ADDRESS=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --plan) MODE=plan ;;
+    --apply) MODE=apply ;;
+    --yes) YES=1 ;;
+    --address) shift; [ "$#" -gt 0 ] || die '--address requires an IPv4 address'; ADDRESS=$1 ;;
+    --help|-h)
+      printf 'Usage: %s [--plan | --apply --yes] --address IPv4\n' "$0"
+      printf '%s\n' 'Runtime-only, exact IPv4 INPUT rule tagged CCDC-OPERATOR-BLOCK; no persistence files are changed.'
+      exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
+done
+case "$ADDRESS" in ''|*[!0-9.]*) die 'Expected one canonical IPv4 address' ;; esac
+printf '%s\n' "$ADDRESS" | awk -F. '
+  NF!=4 {exit 1}
+  {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || length($i)>3 || $i>255 || (length($i)>1 && substr($i,1,1)=="0")) exit 1}
+' || die 'Expected one canonical IPv4 address (no hostname, CIDR or range)'
+[ -n "$ADDRESS" ] || die 'Missing address'
+if [ "$ACTION" = block ]; then
+  case "$ADDRESS" in 0.*|127.*|255.255.255.255) die 'Refusing unspecified, loopback or broadcast address' ;; esac
+  SSH_CLIENT_ADDRESS=${SSH_CONNECTION:-}
+  SSH_CLIENT_ADDRESS=${SSH_CLIENT_ADDRESS%% *}
+  [ "$ADDRESS" != "$SSH_CLIENT_ADDRESS" ] || die 'Refusing the current SSH client address'
 fi
-
-# 2. Input Validation
-IP_ADDR="$1"
-
-if [ -z "$IP_ADDR" ]; then
-  printf "Error: No IP address provided.\n" >&2
-  printf "Usage: %s <ip_address>\n" "$0" >&2
-  exit 1
-fi
-
-# 3. Check if iptables exists
-if ! command -v iptables >/dev/null 2>&1; then
-  printf "Error: iptables command not found.\n" >&2
-  exit 1
-fi
-
-# 4. Apply the Block
-# We use -C to check if the rule exists to avoid duplicates
-if iptables -C INPUT -s "$IP_ADDR" -j DROP 2>/dev/null; then
-  printf "Info: IP %s is already blocked.\n" "$IP_ADDR"
-else
-  # We use -I (Insert) to put the block at the TOP of the chain.
-  # This ensures the IP is blocked even if 'Allow' rules exist lower down.
-  iptables -I INPUT -s "$IP_ADDR" -j DROP
-  printf "Success: Blocked incoming traffic from %s.\n" "$IP_ADDR"
-fi
-
-# 5. Save the Rules (Using your requested logic)
-printf "Saving rules...\n"
-
-if [ -f "/etc/debian_version" ]; then
-  # Ensure the directory exists (Prevent errors on minimal installs)
-  if [ ! -d "/etc/iptables" ]; then
-    mkdir -p /etc/iptables
-  fi
-
-  iptables-save >/etc/iptables/rules.v4
-
-  # Save IPv6 as well to match your previous script's behavior
-  if command -v ip6tables-save >/dev/null 2>&1; then
-    ip6tables-save >/etc/iptables/rules.v6
-  fi
-  printf "Saved to /etc/iptables/rules.v4\n"
-else
-  # Logic for RHEL/CentOS and others
-  # Ensure the directory exists
-  if [ ! -d "/etc/sysconfig" ]; then
-    mkdir -p /etc/sysconfig
-  fi
-
-  iptables-save >/etc/sysconfig/iptables
-
-  # Save IPv6 as well to match your previous script's behavior
-  if command -v ip6tables-save >/dev/null 2>&1; then
-    ip6tables-save >/etc/sysconfig/iptables
-  fi
-  printf "Saved to /etc/sysconfig/iptables\n"
-fi
-
-exit 0
+printf 'Plan: %s inbound IPv4 source %s using only the CCDC-OPERATOR-BLOCK tagged rule; runtime-only\n' "$ACTION" "$ADDRESS"
+[ "$MODE" = apply ] || exit 0
+[ "$YES" -eq 1 ] || die 'Apply requires --yes'
+require_root
+[ "$(uname -s)" = Linux ] || die 'Firewall helpers support Linux only'
+have_cmd iptables || die 'iptables is unavailable'
+iptables -w 5 -S INPUT >/dev/null || die 'Cannot inspect INPUT chain'
+PRESENT=0
+iptables -w 5 -C INPUT -s "$ADDRESS" -m comment --comment CCDC-OPERATOR-BLOCK -j DROP >/dev/null 2>&1 || PRESENT=$?
+case "$PRESENT" in 0|1) ;; *) die 'Cannot check scoped firewall rule' ;; esac
+case "$ACTION:$PRESENT" in
+  block:0) log_info 'Tagged rule already exists' ;;
+  block:1) iptables -w 5 -I INPUT 1 -s "$ADDRESS" -m comment --comment CCDC-OPERATOR-BLOCK -j DROP || die 'Block failed' ;;
+  unblock:0) iptables -w 5 -D INPUT -s "$ADDRESS" -m comment --comment CCDC-OPERATOR-BLOCK -j DROP || die 'Unblock failed' ;;
+  unblock:1) log_info 'No tagged rule exists; unrelated rules are unchanged' ;;
+esac
+log_ok "$ACTION completed; runtime-only"

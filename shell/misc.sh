@@ -1,17 +1,17 @@
 #!/bin/sh
-
-LOG_FILE="./error_log.txt"
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "This script must be run as root."
-  exit 1
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
+. "$SCRIPT_DIR/lib/portable.sh"
+for option in "$@"; do
+  case "$option" in
+    --audit|--plan) : ;;
+    --help|-h) printf 'Usage: %s --audit | --plan\nReports updatedb exclusions without changing indexing policy.\n' "$0"; exit 0 ;;
+    *) die "Unsupported option: $option; indexing policy requires manual review" ;;
+  esac
+done
+if [ -r /etc/updatedb.conf ]; then
+  sed -n '1,200p' /etc/updatedb.conf
+else
+  log_info 'No readable updatedb configuration'
 fi
-
-echo "Starting updatedb configuration..."
-
-echo "Step 1: Clearing updatedb configuration..."
-# Write an empty string/newline to the config file.
-# Any errors (like permission denied) are appended to the log file.
-{ echo "" >/etc/updatedb.conf; } 2>>"$LOG_FILE"
-
-echo "Finished updatedb configuration."
+log_info 'Preserve exclusions for virtual, remote, and sensitive filesystems'

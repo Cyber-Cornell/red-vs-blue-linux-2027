@@ -1,23 +1,13 @@
 #!/bin/sh
-
-LOG_FILE="./error_log.txt"
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "This script must be run as root."
-  exit 1
-fi
-
-echo "Starting DNS configuration..."
-
-echo "Step 1: Setting nameservers in resolv.conf..."
-# Wrap echo commands in a block.
-# > overwrites /etc/resolv.conf.
-# 2>> redirects any write errors to the log file.
-{
-  echo "nameserver 9.9.9.11"
-  echo "nameserver 149.112.112.11"
-  echo "nameserver 2620:fe::11"
-  echo "nameserver 2620:fe::fe:11"
-} >/etc/resolv.conf 2>>"$LOG_FILE"
-
-echo "Finished DNS configuration."
+set -u
+case "${1:---audit}" in
+  --audit|--plan) ;;
+  --help|-h) printf 'Usage: %s [--audit|--plan]\n' "$0"; exit 0 ;;
+  *) printf '%s\n' 'Resolver replacement was retired. Configure DNS through the host network manager after reviewing scored dependencies.' >&2; exit 1 ;;
+esac
+[ "$#" -le 1 ] || exit 1
+printf '%s\n' 'Resolver configuration (read-only):'
+ls -ld /etc/resolv.conf || exit 1
+cat /etc/resolv.conf || exit 1
+if command -v resolvectl >/dev/null 2>&1; then resolvectl status || exit 1; fi
+printf '%s\n' 'Review internal DNS, search domains and resolver ownership before any change.'

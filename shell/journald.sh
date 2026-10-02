@@ -1,117 +1,108 @@
 #!/bin/sh
-# ==============================================================================
-# Journald Configuration Script
-# Supports: Linux (systemd), Solaris (skipped), NodeOS (skipped)
-# Uses configs/journald.conf when available
-# ==============================================================================
+# Install a bounded journald drop-in without replacing distribution defaults.
 
-set -e
+set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd)
+# shellcheck source=lib/portable.sh
+. "$SCRIPT_DIR/lib/portable.sh"
 
-# Source detection library
-if [ -f "$SCRIPT_DIR/lib/detect.sh" ]; then
-  . "$SCRIPT_DIR/lib/detect.sh"
-else
-  case "$(uname -s)" in
-  SunOS) OS_TYPE="solaris" ;;
-  Linux) OS_TYPE="linux" ;;
+MODE=audit
+YES=0
+SOURCE="$SCRIPT_DIR/configs/journald.conf"
+DROPIN_DIR=/etc/systemd/journald.conf.d
+DROPIN="$DROPIN_DIR/90-ccdc.conf"
+
+usage() { printf 'Usage: %s --audit | --plan | --apply --yes\n' "$0"; }
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --audit) MODE=audit ;;
+    --plan) MODE=plan ;;
+    --apply) MODE=apply ;;
+    --yes) YES=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
   esac
+  shift
+done
 
-  if [ -d /run/systemd/system ]; then
-    INIT_SYS="systemd"
-  elif command -v rc-service >/dev/null 2>&1; then
-    INIT_SYS="openrc"
-  else
-    INIT_SYS="sysv"
-  fi
+require_root
+[ "$MODE" != plan ] || { cat "$SOURCE"; exit 0; }
+if ! have_cmd systemctl || [ ! -d /run/systemd/system ]; then
+  log_warn 'systemd is not active; journald stage is not applicable'
+  exit 0
 fi
 
-log_info() { printf "\033[0;32m[INFO]\033[0m %s\n" "$1"; }
-log_warn() { printf "\033[0;33m[WARN]\033[0m %s\n" "$1"; }
-log_err() { printf "\033[0;31m[ERROR]\033[0m %s\n" "$1" >&2; }
+audit_journal() {
+  systemctl status systemd-journald --no-pager 2>/dev/null || true
+  journalctl --disk-usage 2>/dev/null || true
+  if have_cmd systemd-analyze; then
+    systemd-analyze cat-config systemd/journald.conf 2>/dev/null || true
+  else
+    cat /etc/systemd/journald.conf "$DROPIN_DIR"/*.conf 2>/dev/null || true
+  fi
+}
 
-if [ "$(id -u)" -ne 0 ]; then
-  log_err "This script must be run as root."
-  exit 1
+case "$MODE" in
+  audit) audit_journal; exit 0 ;;
+  plan) cat "$SOURCE"; exit 0 ;;
+esac
+
+[ "$YES" -eq 1 ] || die 'Apply requires --yes'
+[ -s "$SOURCE" ] || die "Missing $SOURCE"
+
+STAMP=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d_%H%M%S')
+umask 077
+mkdir -p /var/backups "$DROPIN_DIR" /var/log/journal || die 'Cannot create journald directories'
+ROLLBACK_DIR=$(mktemp -d "/var/backups/ccdc-journald-$STAMP.XXXXXX") || die 'Cannot create rollback directory'
+chmod 700 "$ROLLBACK_DIR"
+[ ! -L "$DROPIN" ] || die 'Refusing symlinked journald drop-in'
+EXISTED=0
+if [ -f "$DROPIN" ]; then
+  EXISTED=1
+  cp -p "$DROPIN" "$ROLLBACK_DIR/90-ccdc.conf"
 fi
 
-log_info "Starting journald configuration..."
-
-SERVICE="systemd-journald"
-
-# ==============================================================================
-# SYSTEMD JOURNALD
-# ==============================================================================
-if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  log_info "Detected Init System: Systemd"
-
-  JOURNALD_CONF="/etc/systemd/journald.conf"
-
-  # Backup existing config
-  if [ -f "$JOURNALD_CONF" ]; then
-    cp "$JOURNALD_CONF" "${JOURNALD_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-  fi
-
-  # Apply journald.conf from configs directory
-  if [ -f "$SCRIPT_DIR/configs/journald.conf" ]; then
-    log_info "Using configs/journald.conf"
-    cat "$SCRIPT_DIR/configs/journald.conf" >"$JOURNALD_CONF"
+restore_journal() {
+  log_warn 'Restoring previous journald drop-in'
+  if [ "$EXISTED" -eq 1 ]; then
+    cp -p "$ROLLBACK_DIR/90-ccdc.conf" "$DROPIN"
   else
-    log_err "configs/journald.conf not found!"
-    exit 1
+    rm -f "$DROPIN"
   fi
+  systemctl restart systemd-journald 2>/dev/null || true
+}
+on_exit() {
+  _result=$?
+  trap - 0
+  if [ "$_result" -ne 0 ]; then restore_journal; fi
+  exit "$_result"
+}
+trap on_exit 0
+trap 'exit 1' HUP INT TERM
+cp -p "$SOURCE" "$DROPIN"
+chown root:root "$DROPIN"
+chmod 644 "$DROPIN"
+systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 
-  chmod 644 "$JOURNALD_CONF"
-
-  # Create persistent journal directory
-  mkdir -p /var/log/journal
-  systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
-
-  log_info "Ensuring $SERVICE is active..."
-  systemctl enable "$SERVICE" 2>/dev/null || true
-
-  log_info "Restarting $SERVICE..."
-  if systemctl restart "$SERVICE"; then
-    :
-  else
-    log_err "Failed to restart $SERVICE."
-  fi
-
-  log_info "Flushing journal to disk..."
-  if systemctl kill --kill-who=main --signal=SIGUSR1 "$SERVICE" 2>/dev/null; then
-    :
-  else
-    journalctl --flush 2>/dev/null || true
-  fi
-
-  # Verify
-  if systemctl is-active --quiet "$SERVICE"; then
-    log_info "Verification: $SERVICE is active and running."
-  else
-    log_err "Verification: $SERVICE is NOT active."
-    exit 1
-  fi
-
-# ==============================================================================
-# OPENRC (Alpine / Gentoo) - No journald
-# ==============================================================================
-elif command -v rc-service >/dev/null 2>&1; then
-  log_info "Detected Init System: OpenRC"
-  log_warn "Systemd-journald is specific to Systemd."
-  log_warn "OpenRC systems usually use 'rsyslog' or 'syslog-ng'."
-  log_warn "Skipping journald configuration."
-
-# ==============================================================================
-# SOLARIS - No journald
-# ==============================================================================
-elif [ "$OS_TYPE" = "solaris" ]; then
-  log_info "Detected OS: Solaris"
-  log_warn "Solaris does not use systemd-journald."
-  log_warn "Solaris uses syslog. Skipping journald configuration."
-
-else
-  log_err "Could not detect Systemd or OpenRC."
+if have_cmd systemd-analyze && ! systemd-analyze cat-config systemd/journald.conf >/dev/null; then
+  die 'Merged journald configuration could not be read; previous state restored'
+fi
+if ! systemctl restart systemd-journald; then
+  die 'systemd-journald restart failed; previous state restored'
+fi
+if ! systemctl is-active --quiet systemd-journald; then
+  die 'systemd-journald is not active; previous state restored'
 fi
 
-log_info "Journald operation complete."
+journalctl --flush 2>/dev/null || true
+journalctl --disk-usage >"$ROLLBACK_DIR/applied-disk-usage.txt" 2>&1 || true
+cat >"$ROLLBACK_DIR/README.txt" <<EOF
+Restore the prior managed drop-in if present, or remove $DROPIN if this
+directory has no 90-ccdc.conf backup. Then run:
+  systemctl restart systemd-journald
+EOF
+chmod 600 "$ROLLBACK_DIR"/* 2>/dev/null || true
+log_ok 'Bounded persistent journald policy applied'
+log_info "Rollback material: $ROLLBACK_DIR"

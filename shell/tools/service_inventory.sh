@@ -1,58 +1,21 @@
 #!/bin/sh
-
-# ==============================================================================
-# Script Name: list_services_sorted.sh
-# Description: Detects Init system (Systemd/OpenRC/SysV), lists running services,
-#              and sorts the output alphabetically.
-#              Portable: Runs on sh, dash, ash, bash.
-# ==============================================================================
-
-# 1. Format Helper
-FMT="%-30s | %s\n"
-
-# 2. Print Header (Printed immediately, not sorted)
-printf "%s\n" "--------------------------------------------------------------------------------"
-printf "$FMT" "Service Name" "Status / Description"
-printf "%s\n" "--------------------------------------------------------------------------------"
-
-# 3. Detect, Execute, and Sort
-# We group the entire logic block in { ... } and pipe it to sort at the end.
-{
-  # --- CHECK 1: SYSTEMD ---
-  if command -v systemctl >/dev/null 2>&1 && systemctl list-units >/dev/null 2>&1; then
-
-    systemctl list-units --type=service --state=running --no-legend --plain --no-pager |
-      while read -r unit load active sub desc; do
-        printf "$FMT" "$unit" "$desc"
-      done
-
-  # --- CHECK 2: OPENRC (Alpine / Gentoo) ---
-  elif command -v rc-status >/dev/null 2>&1; then
-
-    rc-status -a | awk '
-            /\[ *started *\]/ {
-                # $1 is usually the service name
-                service = $1
-                printf "%-30s | %s\n", service, "Running (OpenRC)"
-            }
-        '
-
-  # --- CHECK 3: SYSVINIT (Fallback) ---
-  elif [ -d /etc/init.d ]; then
-
-    for service_script in /etc/init.d/*; do
-      [ ! -x "$service_script" ] && continue
-      service_name=${service_script##*/}
-
-      # Check status (silencing output)
-      if "$service_script" status >/dev/null 2>&1; then
-        printf "$FMT" "$service_name" "Running (SysV)"
-      fi
-    done
-
-  else
-    printf "Error: Could not detect Systemd, OpenRC, or SysVinit.\n" >&2
-    exit 1
-  fi
-
-} | sort
+set -u
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd)
+. "$SCRIPT_DIR/../lib/portable.sh"
+case "${1:-}" in
+  -h|--help) printf 'Usage: %s\nRead-only init state, with process fallback when no supported manager is live.\n' "$0"; exit 0 ;;
+  '') ;;
+  *) die "Unknown argument: $1" ;;
+esac
+if [ -d /run/systemd/system ] && have_cmd systemctl; then
+  systemctl list-units --type=service --all --no-legend --plain --no-pager
+elif have_cmd rc-status; then
+  rc-status -a
+else
+  log_warn 'No supported live init manager; showing processes and init-file metadata only'
+  printf '%s\n' '=== PROCESS FALLBACK (NOT SERVICE HEALTH) ==='
+  ps -e -o pid,comm || exit 1
+  printf '\n%s\n' '=== INIT FILE METADATA (NOT EXECUTED) ==='
+  if [ -d /etc/init.d ]; then ls -l /etc/init.d; fi
+  exit 0
+fi

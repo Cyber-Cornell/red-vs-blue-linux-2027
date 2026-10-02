@@ -1,377 +1,105 @@
 #!/bin/sh
-# =============================================================================
-# CCDC System Backup Script
-# POSIX-compliant, zero-config, optimized for speed and size
-# Saves to /backups/
-# =============================================================================
-
 set -eu
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "This script must be run as root."
-  exit 1
+SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
+. "$SCRIPT_DIR/../lib/portable.sh"
+SOURCES=''
+PROFILE=''
+OUTPUT=''
+MAX_MB=256
+if [ "${CCDC_BACKUP_RUNNING:-0}" != 1 ]; then
+  have_cmd timeout || die 'timeout is required'
+  export CCDC_BACKUP_RUNNING=1
+  exec timeout 300 sh "$0" "$@"
 fi
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-BACKUP_DIR="/backups"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-HOSTNAME=$(hostname)
-MAX_FILE_SIZE_MB=100
-
-# =============================================================================
-# DETECT ENVIRONMENT
-# =============================================================================
-
-CPUS=1
-if [ -f /proc/cpuinfo ]; then
-  CPUS=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
-elif command -v nproc >/dev/null 2>&1; then
-  CPUS=$(nproc 2>/dev/null || echo 1)
-elif command -v sysctl >/dev/null 2>&1; then
-  CPUS=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
-fi
-
-if command -v zstd >/dev/null 2>&1; then
-  COMPRESSOR="zstd -T${CPUS} -3 --long=25"
-  EXT="tar.zst"
-elif command -v pigz >/dev/null 2>&1; then
-  COMPRESSOR="pigz -1 -p ${CPUS}"
-  EXT="tar.gz"
-elif command -v lz4 >/dev/null 2>&1; then
-  COMPRESSOR="lz4 -1"
-  EXT="tar.lz4"
-else
-  COMPRESSOR="gzip -1"
-  EXT="tar.gz"
-fi
-
-THROTTLE=""
-if command -v ionice >/dev/null 2>&1; then
-  THROTTLE="ionice -c 3"
-fi
-if command -v nice >/dev/null 2>&1; then
-  THROTTLE="nice -n 10 ${THROTTLE}"
-fi
-
-echo "[BACKUP] Compressor : ${COMPRESSOR}"
-echo "[BACKUP] CPUs       : ${CPUS}"
-echo "[BACKUP] Throttle   : ${THROTTLE:-none}"
-
-# =============================================================================
-# TAR FEATURE DETECTION
-# =============================================================================
-
-TAR_EXTRA=""
-_tar_help=$(tar --help 2>&1 || true)
-echo "$_tar_help" | grep -q '\-\-sparse' && TAR_EXTRA="${TAR_EXTRA} --sparse"
-echo "$_tar_help" | grep -q '\-\-acls' && TAR_EXTRA="${TAR_EXTRA} --acls"
-echo "$_tar_help" | grep -q '\-\-xattrs' && TAR_EXTRA="${TAR_EXTRA} --xattrs"
-echo "$_tar_help" | grep -q '\-\-selinux' && TAR_EXTRA="${TAR_EXTRA} --selinux"
-echo "$_tar_help" | grep -q '\-\-numeric-owner' && TAR_EXTRA="${TAR_EXTRA} --numeric-owner"
-
-# =============================================================================
-# PREPARE
-# =============================================================================
-
-mkdir -p "${BACKUP_DIR}"
-
-# =============================================================================
-# FIREWALL RULES
-# =============================================================================
-
-echo "[BACKUP] Exporting firewall rules..."
-if command -v iptables-save >/dev/null 2>&1; then
-  iptables-save >"${BACKUP_DIR}/fw_iptables.rules" 2>/dev/null || true
-fi
-if command -v ip6tables-save >/dev/null 2>&1; then
-  ip6tables-save >"${BACKUP_DIR}/fw_ip6tables.rules" 2>/dev/null || true
-fi
-if command -v nft >/dev/null 2>&1; then
-  nft -s list ruleset >"${BACKUP_DIR}/fw_nftables.rules" 2>/dev/null || true
-fi
-
-# =============================================================================
-# PACKAGE LIST
-# =============================================================================
-
-echo "[BACKUP] Saving package list..."
-if command -v dpkg >/dev/null 2>&1; then
-  dpkg --get-selections >"${BACKUP_DIR}/packages_dpkg.list" 2>/dev/null || true
-elif command -v rpm >/dev/null 2>&1; then
-  rpm -qa --qf '%{NAME}\n' | sort >"${BACKUP_DIR}/packages_rpm.list" 2>/dev/null || true
-elif command -v pacman >/dev/null 2>&1; then
-  pacman -Qqe >"${BACKUP_DIR}/packages_pacman.list" 2>/dev/null || true
-elif command -v apk >/dev/null 2>&1; then
-  apk list -I 2>/dev/null | cut -d' ' -f1 >"${BACKUP_DIR}/packages_apk.list" || true
-fi
-
-# =============================================================================
-# CRONTABS
-# =============================================================================
-
-echo "[BACKUP] Saving crontabs..."
-_cron_dir="${BACKUP_DIR}/crontabs"
-mkdir -p "$_cron_dir"
-crontab -l >"${_cron_dir}/root.cron" 2>/dev/null || true
-
-if [ -d /var/spool/cron/crontabs ]; then
-  cp -a /var/spool/cron/crontabs/* "$_cron_dir/" 2>/dev/null || true
-elif [ -d /var/spool/cron ]; then
-  for _f in /var/spool/cron/*; do
-    [ -f "$_f" ] && cp "$_f" "$_cron_dir/" 2>/dev/null || true
-  done
-fi
-
-# =============================================================================
-# DATABASE DUMPS
-# =============================================================================
-
-echo "[BACKUP] Checking for databases..."
-_dump_dir="${BACKUP_DIR}/db_dumps"
-mkdir -p "$_dump_dir"
-
-if command -v mysqldump >/dev/null 2>&1; then
-  if mysqladmin ping >/dev/null 2>&1; then
-    echo "[BACKUP] Dumping MySQL databases..."
-    mysqldump --all-databases --single-transaction --quick \
-      --routines --triggers --events 2>/dev/null \
-      >"${_dump_dir}/mysql_all.sql" || true
-  fi
-fi
-
-if command -v pg_dumpall >/dev/null 2>&1; then
-  if su - postgres -c "psql -c 'SELECT 1'" >/dev/null 2>&1; then
-    echo "[BACKUP] Dumping PostgreSQL databases..."
-    su - postgres -c "pg_dumpall" 2>/dev/null \
-      >"${_dump_dir}/postgres_all.sql" || true
-  fi
-fi
-
-find "$_dump_dir" -maxdepth 1 -type f -empty -delete 2>/dev/null || true
-
-# =============================================================================
-# EXCLUDE LIST
-# =============================================================================
-
-EXCLUDE_FILE="${BACKUP_DIR}/.exclude.tmp"
-
-cat >"${EXCLUDE_FILE}" <<'EXCLUDES'
-proc
-sys
-dev
-tmp
-run
-mnt
-media
-lost+found
-backups/.exclude.tmp
-
-var/tmp
-var/cache
-var/log
-usr/share/doc
-usr/share/man
-usr/share/info
-usr/share/locale
-usr/lib/firmware
-usr/lib/modules
-
-*.log
-*.log.*
-*.gz
-*.tar
-*.tar.*
-*.zip
-*.7z
-*.rar
-*.iso
-*.qcow2
-*.vmdk
-*.vdi
-*.img
-*.swp
-*.tmp
-*.bak
-*.old
-*.pyc
-*.class
-*.o
-*.obj
-core
-core.*
-
-.git
-.svn
-.terraform
-.cache
-__pycache__
-node_modules
-.sass-cache
-
-.bash_history
-.zsh_history
-.lesshst
-.viminfo
-.mysql_history
-.psql_history
-.rediscli_history
-
-client_body_temp
-fastcgi_temp
-proxy_temp
-scgi_temp
-uwsgi_temp
-sess_*
-
-mysql-bin.*
-relay-log.*
-slow-query.log
-general.log
-aria_log.*
-*.sock
-*.pid
-ib_logfile*
-ibdata1
-undo_*
-
-pg_wal
-pg_xlog
-pg_stat_tmp
-pg_replslot
-pg_log
-postmaster.pid
-
-var/lib/docker/overlay2
-var/lib/docker/containers
-var/lib/docker/image
-var/lib/docker/tmp
-var/lib/containerd
-docker.sock
-.docker
-
-var/lib/kubelet/pods
-var/lib/etcd/member/wal
-var/lib/jenkins/workspace
-var/lib/jenkins/builds
-var/lib/jenkins/caches
-var/lib/teleport/log
-var/lib/teleport/proc
-var/lib/influxdb
-var/lib/elasticsearch/nodes
-var/lib/graylog-server/journal
-var/ossec/logs
-var/ossec/queue/diff
-var/ossec/var/run
-var/spool/postfix/active
-var/spool/postfix/hold
-var/spool/postfix/deferred
-var/spool/exim4/input
-.ansible
-EXCLUDES
-
-# =============================================================================
-# DISCOVER DIRECTORIES
-# =============================================================================
-
-echo "[BACKUP] Scanning for directories..."
-
-DIRS_TO_BACKUP=""
-for _d in \
-  /etc \
-  /opt \
-  /root \
-  /home \
-  /srv \
-  /usr/local \
-  /var/www \
-  /var/named \
-  /var/lib/bind \
-  /var/spool/cron \
-  /var/spool/anacron \
-  /var/lib/mysql \
-  /var/lib/pgsql \
-  /var/lib/postgresql \
-  /var/lib/samba \
-  /var/lib/jenkins \
-  /var/lib/gitea \
-  /var/lib/teleport \
-  /var/lib/docker/swarm \
-  /var/lib/docker/volumes \
-  /var/ossec \
-  /etc/kubernetes; do
-  [ -d "$_d" ] && DIRS_TO_BACKUP="${DIRS_TO_BACKUP} ${_d}"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --source|--profile|--output|--max-mb)
+      option=$1; shift; [ "$#" -gt 0 ] || die "$option requires a value"
+      case "$option" in
+        --source)
+          case "$1" in *'
+'*|*'\'*) die 'Source names cannot contain newlines or backslashes' ;; esac
+          SOURCES="$SOURCES
+$1" ;;
+        --profile) PROFILE=$1 ;;
+        --output) OUTPUT=$1 ;;
+        --max-mb) MAX_MB=$1 ;;
+      esac ;;
+    --help|-h)
+      printf 'Usage: %s [--profile configs|critical] [--source PATH ...] --output NEW_DIR [--max-mb 256]\n' "$0"
+      printf '%s\n' 'configs: /etc and /usr/local/etc. critical: configs plus /var/spool/cron, /var/spool/anacron, /root/.ssh.' 'Missing preset paths are recorded; explicit sources must exist. Paths are preserved relative to /.' 'Stop databases before copying live storage; /home and database data are never selected by a preset.'
+      exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
 done
-
-if [ -z "$DIRS_TO_BACKUP" ]; then
-  echo "[BACKUP] ERROR: No directories found to back up."
-  rm -f "${EXCLUDE_FILE}"
-  exit 1
-fi
-
-echo "[BACKUP] Excluding files larger than ${MAX_FILE_SIZE_MB}MB..."
-# shellcheck disable=SC2086
-find $DIRS_TO_BACKUP -xdev -type f -size "+${MAX_FILE_SIZE_MB}M" \
-  2>/dev/null >>"${EXCLUDE_FILE}" || true
-
-# =============================================================================
-# COLLECT EXTRA PATHS
-# =============================================================================
-
-EXTRA_PATHS=""
-for _p in \
-  "${BACKUP_DIR}/db_dumps" \
-  "${BACKUP_DIR}/crontabs" \
-  "${BACKUP_DIR}/fw_iptables.rules" \
-  "${BACKUP_DIR}/fw_ip6tables.rules" \
-  "${BACKUP_DIR}/fw_nftables.rules" \
-  "${BACKUP_DIR}/packages_dpkg.list" \
-  "${BACKUP_DIR}/packages_rpm.list" \
-  "${BACKUP_DIR}/packages_pacman.list" \
-  "${BACKUP_DIR}/packages_apk.list"; do
-  [ -e "$_p" ] && EXTRA_PATHS="${EXTRA_PATHS} ${_p}"
-done
-
-# =============================================================================
-# CREATE ARCHIVE
-# =============================================================================
-
-ARCHIVE_NAME="${HOSTNAME}-${TIMESTAMP}.${EXT}"
-ARCHIVE_PATH="${BACKUP_DIR}/${ARCHIVE_NAME}"
-
-echo "[BACKUP] Creating: ${ARCHIVE_NAME}"
-
-# shellcheck disable=SC2086
-$THROTTLE tar -cpf - \
-  --one-file-system \
-  ${TAR_EXTRA} \
-  -X "${EXCLUDE_FILE}" \
-  ${DIRS_TO_BACKUP} \
-  ${EXTRA_PATHS} \
-  2>/dev/null |
-  $COMPRESSOR >"${ARCHIVE_PATH}"
-
-# =============================================================================
-# CLEANUP AND REPORT
-# =============================================================================
-
-rm -f "${EXCLUDE_FILE}"
-
-if [ -f "${ARCHIVE_PATH}" ]; then
-  _bytes=$(wc -c <"${ARCHIVE_PATH}" | tr -d ' ')
-  if [ "$_bytes" -ge 1073741824 ] 2>/dev/null; then
-    _size="$((_bytes / 1073741824))GB"
-  elif [ "$_bytes" -ge 1048576 ] 2>/dev/null; then
-    _size="$((_bytes / 1048576))MB"
-  elif [ "$_bytes" -ge 1024 ] 2>/dev/null; then
-    _size="$((_bytes / 1024))KB"
-  else
-    _size="${_bytes}B"
+case "$PROFILE" in ''|configs|critical) ;; *) die 'Unknown profile; use configs or critical' ;; esac
+[ -n "$OUTPUT" ] && { [ -n "$PROFILE" ] || [ -n "$SOURCES" ]; } || die 'Select --profile or --source and --output NEW_DIR'
+case "$MAX_MB" in ''|*[!0-9]*) die '--max-mb must be numeric' ;; esac
+[ "$MAX_MB" -ge 1 ] && [ "$MAX_MB" -le 4096 ] || die '--max-mb must be 1..4096'
+have_cmd sha256sum && have_cmd gzip || die 'sha256sum and gzip are required'
+umask 077
+WORK=$(mktemp -d) || die 'Cannot create backup workspace'
+CREATED=0
+SUCCESS=0
+cleanup() {
+  if [ "$CREATED" -eq 1 ] && [ "$SUCCESS" -eq 0 ]; then rm -f "$OUTPUT/backup.tar.gz" "$OUTPUT/backup.tar.gz.sha256"; fi
+  rm -f "$WORK/sources" "$WORK/skipped"
+  rmdir "$WORK"
+}
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+: >"$WORK/sources"
+: >"$WORK/skipped"
+OUTPUT_PARENT=$(CDPATH= cd -P "$(dirname "$OUTPUT")" && pwd) || die 'Output parent does not exist'
+OUTPUT="$OUTPUT_PARENT/$(basename "$OUTPUT")"
+add_source() {
+  path=$1
+  required=$2
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    if [ "$required" -eq 1 ]; then die "Source does not exist: $path"; fi
+    printf 'absent\t%s\n' "$path" >>"$WORK/skipped"
+    return
   fi
-  echo "[BACKUP] Complete: ${ARCHIVE_PATH} (${_size})"
-else
-  echo "[BACKUP] ERROR: Archive was not created."
-  exit 1
+  case "$path" in *'
+'*|*'\'*) die 'Source names cannot contain newlines or backslashes' ;; esac
+  if [ -d "$path" ]; then path=$(CDPATH= cd -P "$path" && pwd); else path=$(CDPATH= cd -P "$(dirname "$path")" && pwd)/$(basename "$path"); fi
+  case "$path" in /|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*) die "Unsupported source: $path" ;; esac
+  case "$OUTPUT/" in "$path/"*) die 'Output cannot be inside any source' ;; esac
+  relative=${path#/}
+  case "$relative" in -*) die 'Source paths cannot begin with an option prefix' ;; esac
+  while IFS= read -r existing; do
+    case "$relative/" in "$existing/"*) printf 'covered-by-selected-source\t%s\t%s\n' "$path" "$existing" >>"$WORK/skipped"; return ;; esac
+    case "$existing/" in "$relative/"*) die 'Overlapping sources: select the parent before its child' ;; esac
+  done <"$WORK/sources"
+  if ! grep -Fxq "$relative" "$WORK/sources"; then printf '%s\n' "$relative" >>"$WORK/sources"; fi
+}
+if [ -n "$PROFILE" ]; then
+  for path in /etc /usr/local/etc; do add_source "$path" 0; done
 fi
+if [ "$PROFILE" = critical ]; then
+  for path in /var/spool/cron /var/spool/anacron /root/.ssh; do add_source "$path" 0; done
+fi
+while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  add_source "$path" 1
+done <<EOF
+$SOURCES
+EOF
+[ -s "$WORK/sources" ] || die 'No existing source paths'
+FREE_KB=$(df -Pk "$OUTPUT_PARENT" | awk 'NR==2 {print $4}')
+case "$FREE_KB" in ''|*[!0-9]*) die 'Cannot determine available space' ;; esac
+[ "$FREE_KB" -gt $((MAX_MB * 1024 + 102400)) ] || die 'Insufficient space for the limit plus a 100 MiB reserve'
+mkdir -m 700 "$OUTPUT" || die 'Output must be a new directory with an existing parent'
+CREATED=1
+ulimit -f $((MAX_MB * 2048)) || die 'Cannot enforce file-size limit'
+cp "$WORK/sources" "$OUTPUT/sources.txt"
+cp "$WORK/skipped" "$OUTPUT/skipped-sources.tsv"
+ARCHIVE="$OUTPUT/backup.tar.gz"
+tar -czf "$ARCHIVE" -C / -T "$OUTPUT/sources.txt" 2>"$OUTPUT/tar.log"
+gzip -t "$ARCHIVE"
+tar -tzf "$ARCHIVE" >"$OUTPUT/contents.txt"
+(cd "$OUTPUT" && sha256sum backup.tar.gz >backup.tar.gz.sha256)
+printf 'profile=%s\ncreated=%s\nmax_mb=%s\nreserve_kb=102400\n' "$PROFILE" "$(utc_now)" "$MAX_MB" >"$OUTPUT/metadata.txt"
+SUCCESS=1
+log_ok "Verified backup: $ARCHIVE"

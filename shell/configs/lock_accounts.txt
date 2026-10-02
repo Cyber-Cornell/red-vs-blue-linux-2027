@@ -1,0 +1,3 @@
+# Add one reviewed unauthorized account per line.
+# This file is intentionally empty by default. Never populate it from a blanket
+# UID threshold: scored services and competition users vary by event.
